@@ -1,5 +1,5 @@
 # HANDOFF — unifi-provider
-_Mis à jour : 2026-10-15 13:00_
+_Mis à jour : 2026-10-15 14:00_
 
 ## Objectif
 Faire évoluer le provider Terraform/OpenTofu UniFi (`ubiquiti-community/terraform-provider-unifi`, fork `kallioli`) pour couvrir ce qui manque au réseau domestique de Kevin en infrastructure as code (projet voisin `~/work/unifi-network`, provider `~> 0.56`). Première cible, décidée par Kevin le 2026-10-15 : le réglage **SNMP / SNMPv3 du contrôleur** (Settings > System > SNMP), aujourd'hui posé à la main dans l'UI pour la supervision Zabbix.
@@ -10,13 +10,16 @@ Faire évoluer le provider Terraform/OpenTofu UniFi (`ubiquiti-community/terrafo
 - [x] `go vet ./...` OK. Tests unitaires `go test ./...` OK (paquets `unifi` et `unifi/validators`). Sans `TF_ACC`, les tests d'acceptation sont ignorés : aucun contrôleur contacté.
 - [x] 2026-10-15 : réponse du lobby (lecture publique GitHub de son côté) : amont `main` = `647cf534`, dernier tag stable **v0.59.0** (v0.60.0-beta.0 en cours). Le `main` du fork (`ef0da40c`) a 4 mois de retard. **Aucun bloc `snmp` ni fichier snmp en amont** : le travail reste à faire.
 - [ ] `git fetch upstream` : **non lancé**, github.com n'est pas au registre des accès (règle imposée : demander à Kevin avant toute connexion, même en lecture). À faire dès que Kevin ouvre l'accès (question a).
-- [ ] Récupérer le travail en cours de Kevin (poste dev-kevin, à pousser sur une branche du fork) : en attente. **Ne pas écrire de code avant** : s'il a commencé le bloc snmp, on repart de là.
-- [ ] Bloc `snmp` dans `unifi_setting` : à faire (voir Notes, « Où insérer SNMP »), sur une branche `claude/setting-snmp` basée sur **`upstream/main`**, pas sur le `main` du fork. Ne pas toucher au `main` local.
+- [x] 2026-10-15 : **accès SSH en lecture à dev-kevin (`kallioli@10.25.0.19`) validé par Kevin dans la session**, dépôt `~/Projects/terraform-provider-unifi` (et `~/Projects/go-unifi`). Toutes les refs rapatriées en local : remote `devkevin` (9 branches + `main` = v0.59.0), `devkevin-upstream/*` (copie de l'amont au 2026-10-03, `bfdb8627`), tags jusqu'à v0.59.0.
+- [x] **Aucun travail SNMP sur dev-kevin** : pas de branche, pas de commit, pas de stash, copie de travail propre, rien non plus dans go-unifi. Les 9 branches locales de Kevin (non poussées sur le fork) portent sur les défauts statiques, device config_network, port_forward `enabled` ; dernière activité 2026-10-03.
+- [x] **Piste trouvée dans les notes de Kevin du 2026-10-03** : la PR amont **#485 (jaxzin)** ajoute `snmp` à `unifi_setting`. Bloquée par sa base (`feat/attribute-nesting`, PR #478, helpers `util.NestFields`/`WithObject`/`UpgradeRawState`), Kevin a demandé un rebase sur `main`. Réserve de Kevin : l'écho en lecture de `community`/`x_password` n'est vérifié que sur l'image de test, et **le réglage `snmp` est absent de `get/setting` sur un vrai UCG-Fiber 10.6.106** ; il a suggéré le motif write-only `password_wo`. État actuel de #485 demandé au lobby.
+- [ ] Bloc `snmp` dans `unifi_setting` : à faire (voir Notes, « Où insérer SNMP »), sur une branche `claude/setting-snmp` basée sur **`upstream/main`** (en attendant l'accès GitHub : `devkevin-upstream/main`, 2026-10-03, à rafraîchir ensuite), pas sur le `main` du fork. Ne pas toucher au `main` local. Décision à prendre : repartir de #485 (si rebasée) ou écrire le bloc ici.
 - [ ] Contrôleur de test en conteneur podman sur la VM : accepté par le lobby, **commande prête (voir Notes), à lancer seulement après le go de Kevin**.
 
 ## Prochaine étape
-1. Attendre le go de Kevin sur l'accès GitHub, puis `git fetch upstream origin` (lecture) et lire sa branche si elle est poussée.
-2. Créer `claude/setting-snmp` depuis `upstream/main` (v0.59.x), y rebaser ou cerise-piquer le travail de Kevin, puis ajouter le bloc `snmp` à `unifi_setting` en suivant le modèle `igmp_snooping` (commit `f6939506`), avec test unitaire de conversion.
+1. Réponse du lobby sur la PR amont #485 : ouverte, rebasée, fermée ? Si elle est rebasée sur `main` et propre, la stratégie devient : la relire, la tester, et pousser l'amont à la fusionner (ou la reprendre avec l'accord de son auteur). Sinon, écrire le bloc ici.
+2. Créer `claude/setting-snmp` depuis `devkevin-upstream/main` (puis `upstream/main` dès l'accès GitHub), ajouter le bloc `snmp` à `unifi_setting` en suivant le modèle `igmp_snooping` (commit `f6939506`), mot de passe en **write-only** (`password_wo`, motif suggéré par Kevin sur #485) plutôt que `Sensitive` + relecture, avec test unitaire de conversion.
+3. Question c revisitée : le vrai point à vérifier est si `get/setting` renvoie une entrée `snmp` sur le contrôleur de Kevin (absente sur un UCG-Fiber 10.6.106 selon ses notes). Si elle n'existe qu'après un premier `set`, le Create doit tolérer `NotFoundError` (déjà le cas dans le modèle igmp). Test sur le conteneur après le go de Kevin, et un `GET` par Kevin sur son contrôleur.
 3. Mettre à jour `docs/resources/setting.md` par `go generate ./...` (tfplugindocs est déclaré en `tool` dans go.mod), plus `examples/resources/unifi_setting/resource.tf` et `CHANGELOG.md`.
 
 ## Blocages / questions pour Kevin
@@ -84,3 +87,5 @@ Sans `UNIFI_SKIP_CONTAINER`, `make testacc` lance lui-même le compose via testc
 
 ### Demandes ouvertes (sessions)
 - Lobby, 2026-10-15 : état des lieux + HANDOFF. Réponse envoyée le 2026-10-15 ; retour du lobby reçu (amont v0.59.0, consignes de branche, conteneur accepté). Questions (a) accès GitHub et (d) cible PR/release remontées à Kevin par le lobby : **en attente**.
+- Vers le lobby, 2026-10-15 14:00 : demande de l'état de la PR amont #485 (snmp) et de #478 (attribute-nesting) en lecture publique GitHub. **En attente.**
+- Accès dev-kevin : validé par Kevin le 2026-10-15 en session, lecture seule, compte `kallioli`, dépôts `~/Projects/terraform-provider-unifi` et `~/Projects/go-unifi`. À inscrire au registre s'il doit durer.
