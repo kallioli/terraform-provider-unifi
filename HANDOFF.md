@@ -1,5 +1,5 @@
 # HANDOFF — unifi-provider
-_Mis à jour : 2026-10-15 22:40_
+_Mis à jour : 2026-10-15 23:10_
 
 ## Objectif
 Faire évoluer le provider Terraform/OpenTofu UniFi (`ubiquiti-community/terraform-provider-unifi`, fork `kallioli`) pour couvrir ce qui manque au réseau domestique de Kevin en infrastructure as code (projet voisin `~/work/unifi-network`, provider `~> 0.56`). Première cible, décidée par Kevin le 2026-10-15 : le réglage **SNMP / SNMPv3 du contrôleur** (Settings > System > SNMP), aujourd'hui posé à la main dans l'UI pour la supervision Zabbix.
@@ -98,5 +98,5 @@ Conception : bloc `snmp` optionnel avec `enabled`, `community` (Sensitive, relu)
 ### Demandes ouvertes (sessions)
 - Lobby, 2026-10-15 : état des lieux + HANDOFF. Réponse envoyée le 2026-10-15 ; retour du lobby reçu (amont v0.59.0, consignes de branche, conteneur accepté). Questions (a) accès GitHub et (d) cible PR/release remontées à Kevin par le lobby : **en attente**.
 - Vers le lobby, 2026-10-15 14:00 : demande de l'état de la PR amont #485 (snmp) et de #478. **Refusée par le lobby, à raison** : github.com hors registre pour lui aussi. Question remontée à Kevin par le lobby avec la demande d'accès github.com en lecture. **En attente de Kevin, pas de code avant.**
-- Accès `10.99.0.1` (production domestique) : demandé par Kevin le 2026-10-15 pour tester #485 ; clé API attendue via `UNIFI_API_KEY` (le lanceur `claude-session` ne source que `~/.config/claude-vm/gitlab.env`, donc la variable va dans ce fichier ou le lanceur doit sourcer un autre fichier ; relance de session nécessaire). Lecture libre, écriture uniquement sur validation du payload exact.
+- Accès `10.99.0.1` : **inscrit au registre le 2026-10-15** (`UNIFI_API`, `UNIFI_API_KEY` par variables d'environnement ; lecture, plan, import libres ; toute écriture = validation de Kevin sur le plan exact ; `TF_ACC=1` interdit contre ce contrôleur). Le fork GitHub `kallioli/terraform-provider-unifi` est aussi au registre (fetch, push `claude/*`, pas de PR amont sans accord de Kevin).
 - Accès dev-kevin : validé par Kevin le 2026-10-15 en session, lecture seule, compte `kallioli`, dépôts `~/Projects/terraform-provider-unifi` et `~/Projects/go-unifi`. À inscrire au registre s'il doit durer.
