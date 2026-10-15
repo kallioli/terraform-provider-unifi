@@ -5,13 +5,18 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
+	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/boolplanmodifier"
@@ -22,6 +27,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/hashicorp/terraform-plugin-framework/types/basetypes"
 	"github.com/ubiquiti-community/go-unifi/unifi"
@@ -31,11 +37,23 @@ import (
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                = &wanResource{}
-	_ resource.ResourceWithImportState = &wanResource{}
+	_ resource.Resource                 = &wanResource{}
+	_ resource.ResourceWithImportState  = &wanResource{}
+	_ resource.ResourceWithIdentity     = &wanResource{}
+	_ resource.ResourceWithUpgradeState = &wanResource{}
+)
+
+// Ensure provider defined types fully satisfy list interfaces.
+var (
+	_ list.ListResource              = &wanResource{}
+	_ list.ListResourceWithConfigure = &wanResource{}
 )
 
 func NewWANResource() resource.Resource {
+	return &wanResource{}
+}
+
+func NewWANListResource() list.ListResource {
 	return &wanResource{}
 }
 
@@ -44,15 +62,27 @@ type wanResource struct {
 	client *Client
 }
 
-// wanResourceModel describes the resource data model.
-type wanResourceModel struct {
+// wanIdentityModel describes the resource identity data model.
+type wanIdentityModel struct {
 	ID   types.String `tfsdk:"id"`
 	Site types.String `tfsdk:"site"`
-	Name types.String `tfsdk:"name"`
+}
+
+// wanResourceModel describes the resource data model.
+type wanResourceModel struct {
+	ID           types.String `tfsdk:"id"`
+	Site         types.String `tfsdk:"site"`
+	Name         types.String `tfsdk:"name"`
+	NetworkGroup types.String `tfsdk:"networkgroup"`
 
 	// WAN Type Settings
 	Type   types.String `tfsdk:"type"`
 	TypeV6 types.String `tfsdk:"type_v6"`
+
+	// PPPoE credentials, used when type = "pppoe".
+	Username   types.String `tfsdk:"username"`
+	Password   types.String `tfsdk:"password"`
+	PasswordWO types.String `tfsdk:"password_wo"`
 
 	// VLAN Settings
 	Vlan types.Object `tfsdk:"vlan"`
@@ -87,11 +117,37 @@ type wanResourceModel struct {
 	IPv6SettingPreference types.String `tfsdk:"ipv6_setting_preference"`
 	SingleNetworkLAN      types.String `tfsdk:"single_network_lan"`
 	MACOverrideEnabled    types.Bool   `tfsdk:"mac_override_enabled"`
-	DsliteRemoteHost      types.String `tfsdk:"wan_dslite_remote_host"`
-	DsliteRemoteHostAuto  types.Bool   `tfsdk:"wan_dslite_remote_host_auto"`
+	Dslite                types.Object `tfsdk:"dslite"`
 
 	// Provider Capabilities
 	ProviderCapabilities types.Object `tfsdk:"provider_capabilities"`
+
+	Timeouts timeouts.Value `tfsdk:"timeouts"`
+}
+
+// wanListConfigModel describes the list configuration model.
+type wanListConfigModel struct {
+	Site   types.String `tfsdk:"site"`
+	Filter types.List   `tfsdk:"filter"`
+}
+
+// wanListFilterModel represents a single name/value filter entry.
+type wanListFilterModel struct {
+	Name  types.String `tfsdk:"name"`
+	Value types.String `tfsdk:"value"`
+}
+
+// wanDsliteModel describes the DS-Lite (AFTR) configuration nested object.
+type wanDsliteModel struct {
+	RemoteHost     types.String `tfsdk:"remote_host"`
+	RemoteHostAuto types.Bool   `tfsdk:"remote_host_auto"`
+}
+
+func (m wanDsliteModel) AttributeTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"remote_host":      types.StringType,
+		"remote_host_auto": types.BoolType,
+	}
 }
 
 // vlanModel describes the VLAN configuration.
@@ -161,24 +217,35 @@ func (m dhcpOptionModel) AttributeTypes() map[string]attr.Type {
 	}
 }
 
+// dnsIPv6Model describes the IPv6 half of the DNS configuration (dns.ipv6).
+type dnsIPv6Model struct {
+	Primary    types.String `tfsdk:"primary"`
+	Secondary  types.String `tfsdk:"secondary"`
+	Preference types.String `tfsdk:"preference"`
+}
+
+func (m dnsIPv6Model) AttributeTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"primary":    types.StringType,
+		"secondary":  types.StringType,
+		"preference": types.StringType,
+	}
+}
+
 // dnsModel describes the DNS configuration nested object.
 type dnsModel struct {
-	Primary        types.String `tfsdk:"primary"`
-	Secondary      types.String `tfsdk:"secondary"`
-	IPv6Primary    types.String `tfsdk:"ipv6_primary"`
-	IPv6Secondary  types.String `tfsdk:"ipv6_secondary"`
-	Preference     types.String `tfsdk:"preference"`
-	IPv6Preference types.String `tfsdk:"ipv6_preference"`
+	Primary    types.String `tfsdk:"primary"`
+	Secondary  types.String `tfsdk:"secondary"`
+	Preference types.String `tfsdk:"preference"`
+	IPv6       types.Object `tfsdk:"ipv6"`
 }
 
 func (m dnsModel) AttributeTypes() map[string]attr.Type {
 	return map[string]attr.Type{
-		"primary":         types.StringType,
-		"secondary":       types.StringType,
-		"ipv6_primary":    types.StringType,
-		"ipv6_secondary":  types.StringType,
-		"preference":      types.StringType,
-		"ipv6_preference": types.StringType,
+		"primary":    types.StringType,
+		"secondary":  types.StringType,
+		"preference": types.StringType,
+		"ipv6":       types.ObjectType{AttrTypes: dnsIPv6Model{}.AttributeTypes()},
 	}
 }
 
@@ -227,20 +294,31 @@ func (m igmpProxyModel) AttributeTypes() map[string]attr.Type {
 	}
 }
 
+// dhcpv6PDModel describes the DHCPv6 prefix delegation settings (dhcpv6.pd).
+type dhcpv6PDModel struct {
+	Size     types.Int64 `tfsdk:"size"`
+	SizeAuto types.Bool  `tfsdk:"size_auto"`
+}
+
+func (m dhcpv6PDModel) AttributeTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"size":      types.Int64Type,
+		"size_auto": types.BoolType,
+	}
+}
+
 // dhcpv6WanModel describes the DHCPv6 WAN configuration nested object.
 type dhcpv6WanModel struct {
 	CoS            types.Int64  `tfsdk:"cos"`
-	PDSize         types.Int64  `tfsdk:"pd_size"`
-	PDSizeAuto     types.Bool   `tfsdk:"pd_size_auto"`
+	PD             types.Object `tfsdk:"pd"`
 	Options        types.List   `tfsdk:"options"`
 	DelegationType types.String `tfsdk:"wan_delegation_type"`
 }
 
 func (m dhcpv6WanModel) AttributeTypes() map[string]attr.Type {
 	return map[string]attr.Type{
-		"cos":          types.Int64Type,
-		"pd_size":      types.Int64Type,
-		"pd_size_auto": types.BoolType,
+		"cos": types.Int64Type,
+		"pd":  types.ObjectType{AttrTypes: dhcpv6PDModel{}.AttributeTypes()},
 		"options": types.ListType{
 			ElemType: types.ObjectType{AttrTypes: dhcpOptionModel{}.AttributeTypes()},
 		},
@@ -271,6 +349,33 @@ func (r *wanResource) Metadata(
 	resp.TypeName = req.ProviderTypeName + "_wan"
 }
 
+// IdentitySchema implements [resource.ResourceWithIdentity].
+func (r *wanResource) IdentitySchema(
+	_ context.Context,
+	_ resource.IdentitySchemaRequest,
+	resp *resource.IdentitySchemaResponse,
+) {
+	resp.IdentitySchema = identityschema.Schema{
+		Version: 1,
+		Attributes: map[string]identityschema.Attribute{
+			"id": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+			"site": identityschema.StringAttribute{
+				OptionalForImport: true,
+			},
+		},
+	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity]. See
+// siteIdentityUpgraders.
+func (r *wanResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return siteIdentityUpgraders(func() *Client { return r.client })
+}
+
 func (r *wanResource) Schema(
 	ctx context.Context,
 	req resource.SchemaRequest,
@@ -278,6 +383,11 @@ func (r *wanResource) Schema(
 ) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "WAN network resource",
+		// Version history:
+		//   0: initial schema (flat wan_dslite_*, dns.ipv6_*, dhcpv6.pd_size*).
+		//   1: those prefixed attributes are nested objects (dslite, dns.ipv6,
+		//      dhcpv6.pd). See UpgradeState.
+		Version: 1,
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
 				Computed:            true,
@@ -299,6 +409,26 @@ func (r *wanResource) Schema(
 				Required:            true,
 				MarkdownDescription: "The name of the WAN network",
 			},
+			"networkgroup": schema.StringAttribute{
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "The WAN network group this interface belongs to " +
+					"(`WAN`, `WAN2`, …). The primary uplink is `WAN`; a secondary/SFP " +
+					"uplink is `WAN2`. Computed from the controller when unset (so an " +
+					"imported `WAN2` is preserved), defaulting to `WAN` on create. " +
+					"Required to manage multi-WAN (WAN2+) setups, where a hard-coded " +
+					"`WAN` collides with the primary " +
+					"(`api.err.WanConfigurationForNetworkGroupAlreadyExists`).",
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+				Validators: []validator.String{
+					stringvalidator.RegexMatches(
+						regexp.MustCompile(`^WAN([2-9])?$|^WAN_LTE_FAILOVER$`),
+						"must be WAN, WAN2-WAN9, or WAN_LTE_FAILOVER",
+					),
+				},
+			},
 			"type": schema.StringAttribute{
 				Optional:            true,
 				Computed:            true,
@@ -308,15 +438,54 @@ func (r *wanResource) Schema(
 					stringvalidator.OneOf("dhcp", "static", "pppoe", "disabled"),
 				},
 			},
+			"username": schema.StringAttribute{
+				Optional: true,
+				MarkdownDescription: "PPPoE username supplied by the ISP. Only " +
+					"meaningful when `type` is `pppoe`. Left unset, the attribute is " +
+					"not written and whatever the controller holds is preserved, so an " +
+					"imported PPPoE uplink can be managed without touching its login.",
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
+			"password": schema.StringAttribute{
+				Optional:  true,
+				Sensitive: true,
+				MarkdownDescription: "PPPoE password supplied by the ISP. Stored in " +
+					"state - use `password_wo` to avoid persisting the secret. Only " +
+					"meaningful when `type` is `pppoe`.",
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+					stringvalidator.ConflictsWith(path.MatchRoot("password_wo")),
+				},
+			},
+			"password_wo": schema.StringAttribute{
+				MarkdownDescription: "Write-only equivalent of `password` " +
+					"(Terraform 1.11+). Used at apply time but never written to state, " +
+					"so it can be sourced from an ephemeral resource. Because nothing " +
+					"is stored, the provider cannot detect a password changed outside " +
+					"Terraform: such a change produces no diff. Mutually exclusive " +
+					"with `password`.",
+				Optional:  true,
+				Sensitive: true,
+				WriteOnly: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
 			"type_v6": schema.StringAttribute{
-				Optional:            true,
-				Computed:            true,
-				MarkdownDescription: "The IPv6 WAN type (dhcpv6, static, disabled)",
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "The IPv6 WAN type. One of `dhcpv6`, `slaac`, " +
+					"`static`, or `disabled`. Note: the controller requires `slaac` when " +
+					"the IPv6 delegation type is `single_network` " +
+					"(`api.err.SingleNetworkMustBeSLAAC` otherwise) — common with ISPs that " +
+					"deliver IPv6 by Router Advertisement, e.g. Free/Freebox in bridge mode.",
 				PlanModifiers: []planmodifier.String{
 					stringplanmodifier.UseStateForUnknown(),
 				},
 				Validators: []validator.String{
-					stringvalidator.OneOf("dhcpv6", "static", "disabled"),
+					stringvalidator.OneOf("dhcpv6", "slaac", "static", "disabled"),
 				},
 			},
 			"vlan": schema.SingleNestedAttribute{
@@ -391,14 +560,6 @@ func (r *wanResource) Schema(
 							validators.IPv4Validator(),
 						},
 					},
-					"ipv6_primary": schema.StringAttribute{
-						Optional:            true,
-						MarkdownDescription: "Primary IPv6 DNS server",
-					},
-					"ipv6_secondary": schema.StringAttribute{
-						Optional:            true,
-						MarkdownDescription: "Secondary IPv6 DNS server",
-					},
 					"preference": schema.StringAttribute{
 						Optional:            true,
 						Computed:            true,
@@ -410,15 +571,30 @@ func (r *wanResource) Schema(
 							stringvalidator.OneOf("auto", "manual"),
 						},
 					},
-					"ipv6_preference": schema.StringAttribute{
+					"ipv6": schema.SingleNestedAttribute{
 						Optional:            true,
 						Computed:            true,
-						MarkdownDescription: "IPv6 DNS preference (auto, manual)",
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
-						},
-						Validators: []validator.String{
-							stringvalidator.OneOf("auto", "manual"),
+						MarkdownDescription: "IPv6 DNS configuration",
+						Attributes: map[string]schema.Attribute{
+							"primary": schema.StringAttribute{
+								Optional:            true,
+								MarkdownDescription: "Primary IPv6 DNS server",
+							},
+							"secondary": schema.StringAttribute{
+								Optional:            true,
+								MarkdownDescription: "Secondary IPv6 DNS server",
+							},
+							"preference": schema.StringAttribute{
+								Optional:            true,
+								Computed:            true,
+								MarkdownDescription: "IPv6 DNS preference (auto, manual)",
+								PlanModifiers: []planmodifier.String{
+									stringplanmodifier.UseStateForUnknown(),
+								},
+								Validators: []validator.String{
+									stringvalidator.OneOf("auto", "manual"),
+								},
+							},
 						},
 					},
 				},
@@ -479,23 +655,33 @@ func (r *wanResource) Schema(
 							int64validator.Between(0, 7),
 						},
 					},
-					"pd_size": schema.Int64Attribute{
+					"pd": schema.SingleNestedAttribute{
 						Optional:            true,
 						Computed:            true,
-						MarkdownDescription: "DHCPv6 prefix delegation size",
-						PlanModifiers: []planmodifier.Int64{
-							int64planmodifier.UseStateForUnknown(),
+						MarkdownDescription: "DHCPv6 prefix delegation configuration",
+						PlanModifiers: []planmodifier.Object{
+							objectplanmodifier.UseStateForUnknown(),
 						},
-						Validators: []validator.Int64{
-							int64validator.Between(48, 64),
-						},
-					},
-					"pd_size_auto": schema.BoolAttribute{
-						Optional:            true,
-						Computed:            true,
-						MarkdownDescription: "Whether DHCPv6 PD size is automatic",
-						PlanModifiers: []planmodifier.Bool{
-							boolplanmodifier.UseStateForUnknown(),
+						Attributes: map[string]schema.Attribute{
+							"size": schema.Int64Attribute{
+								Optional:            true,
+								Computed:            true,
+								MarkdownDescription: "DHCPv6 prefix delegation size",
+								PlanModifiers: []planmodifier.Int64{
+									int64planmodifier.UseStateForUnknown(),
+								},
+								Validators: []validator.Int64{
+									int64validator.Between(48, 64),
+								},
+							},
+							"size_auto": schema.BoolAttribute{
+								Optional:            true,
+								Computed:            true,
+								MarkdownDescription: "Whether DHCPv6 PD size is automatic",
+								PlanModifiers: []planmodifier.Bool{
+									boolplanmodifier.UseStateForUnknown(),
+								},
+							},
 						},
 					},
 					"options": schema.ListNestedAttribute{
@@ -721,38 +907,133 @@ func (r *wanResource) Schema(
 					boolplanmodifier.UseStateForUnknown(),
 				},
 			},
-			"wan_dslite_remote_host": schema.StringAttribute{
+			"dslite": schema.SingleNestedAttribute{
 				Optional:            true,
 				Computed:            true,
-				MarkdownDescription: "The DS-Lite AFTR remote host. Only used when `wan_dslite_remote_host_auto` is disabled.",
-				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
+				MarkdownDescription: "DS-Lite (AFTR) configuration.",
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
 				},
-			},
-			"wan_dslite_remote_host_auto": schema.BoolAttribute{
-				Optional:            true,
-				Computed:            true,
-				MarkdownDescription: "Whether the DS-Lite AFTR remote host is detected automatically.",
-				PlanModifiers: []planmodifier.Bool{
-					boolplanmodifier.UseStateForUnknown(),
+				Attributes: map[string]schema.Attribute{
+					"remote_host": schema.StringAttribute{
+						Optional:            true,
+						Computed:            true,
+						MarkdownDescription: "The DS-Lite AFTR remote host. Only used when `remote_host_auto` is disabled.",
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
+					},
+					"remote_host_auto": schema.BoolAttribute{
+						Optional:            true,
+						Computed:            true,
+						MarkdownDescription: "Whether the DS-Lite AFTR remote host is detected automatically.",
+						PlanModifiers: []planmodifier.Bool{
+							boolplanmodifier.UseStateForUnknown(),
+						},
+					},
 				},
 			},
 			"provider_capabilities": schema.SingleNestedAttribute{
-				Optional:            true,
-				MarkdownDescription: "WAN provider capabilities",
+				Optional: true,
+				Computed: true,
+				MarkdownDescription: "WAN provider capabilities (line rate). Detected/" +
+					"populated by the controller; preserved when not set in config.",
+				PlanModifiers: []planmodifier.Object{
+					objectplanmodifier.UseStateForUnknown(),
+				},
 				Attributes: map[string]schema.Attribute{
 					"download_kilobits_per_second": schema.Int64Attribute{
-						Required:            true,
+						Optional:            true,
+						Computed:            true,
 						MarkdownDescription: "Download speed in kilobits per second",
+						PlanModifiers: []planmodifier.Int64{
+							int64planmodifier.UseStateForUnknown(),
+						},
 					},
 					"upload_kilobits_per_second": schema.Int64Attribute{
-						Required:            true,
+						Optional:            true,
+						Computed:            true,
 						MarkdownDescription: "Upload speed in kilobits per second",
+						PlanModifiers: []planmodifier.Int64{
+							int64planmodifier.UseStateForUnknown(),
+						},
 					},
 				},
 			},
+			"timeouts": timeouts.Attributes(ctx, timeouts.Opts{
+				Create: true,
+				Read:   true,
+				Update: true,
+				Delete: true,
+			}),
 		},
 	}
+}
+
+// UpgradeState migrates prior WAN state to the current schema version.
+//
+//	v0 -> v1: the flat wan_dslite_remote_host{,_auto}, dns.ipv6_* and
+//	    dhcpv6.pd_size{,_auto} attributes move into the nested dslite,
+//	    dns.ipv6 and dhcpv6.pd objects. See nestWANState.
+func (r *wanResource) UpgradeState(
+	ctx context.Context,
+) map[int64]resource.StateUpgrader {
+	var schemaResp resource.SchemaResponse
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	upgrader := func(rewrite func(state map[string]any)) resource.StateUpgrader {
+		return resource.StateUpgrader{
+			StateUpgrader: func(
+				ctx context.Context,
+				req resource.UpgradeStateRequest,
+				resp *resource.UpgradeStateResponse,
+			) {
+				if req.RawState == nil {
+					return
+				}
+				dv, err := util.UpgradeRawState(
+					schemaType,
+					req.RawState.JSON,
+					func(state map[string]any) {
+						rewrite(state)
+						nestWANState(state)
+					},
+				)
+				if err != nil {
+					resp.Diagnostics.AddError("Failed to upgrade WAN state", err.Error())
+					return
+				}
+				resp.DynamicValue = dv
+			},
+		}
+	}
+
+	return map[int64]resource.StateUpgrader{
+		0: upgrader(func(map[string]any) {}),
+	}
+}
+
+// nestWANState rewrites flat v0 WAN state into the nested-object shape of the
+// current schema.
+func nestWANState(state map[string]any) {
+	util.NestFields(state, "dslite", map[string]string{
+		"wan_dslite_remote_host":      "remote_host",
+		"wan_dslite_remote_host_auto": "remote_host_auto",
+	})
+	util.WithObject(state, "dns", func(dns map[string]any) {
+		util.NestFields(dns, "ipv6", map[string]string{
+			"ipv6_primary":    "primary",
+			"ipv6_secondary":  "secondary",
+			"ipv6_preference": "preference",
+		})
+	})
+	util.WithObject(state, "dhcpv6", func(dhcpv6 map[string]any) {
+		util.NestFields(dhcpv6, "pd", map[string]string{
+			"pd_size":      "size",
+			"pd_size_auto": "size_auto",
+		})
+	})
 }
 
 func (r *wanResource) Configure(
@@ -791,6 +1072,19 @@ func (r *wanResource) Create(
 
 	// Read Terraform plan data into the model
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &plan)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	createTimeout, timeoutDiags := plan.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
+	plan.PasswordWO = r.readPasswordWO(ctx, req.Config, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -841,8 +1135,13 @@ func (r *wanResource) Create(
 			}
 
 			// Overlay explicit config values onto the API state
-			r.overlayConfig(&state, &config, &plan)
+			r.overlayConfig(ctx, &state, &config, &plan)
+			state.Timeouts = plan.Timeouts
 
+			resp.Diagnostics.Append(resp.Identity.Set(ctx, wanIdentityModel{
+				ID:   state.ID,
+				Site: state.Site,
+			})...)
 			resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 			return
 		}
@@ -870,9 +1169,14 @@ func (r *wanResource) Create(
 	}
 
 	// Overlay explicit config values onto the API state
-	r.overlayConfig(&state, &config, &plan)
+	r.overlayConfig(ctx, &state, &config, &plan)
+	state.Timeouts = plan.Timeouts
 
 	// Save data into Terraform state
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, wanIdentityModel{
+		ID:   state.ID,
+		Site: state.Site,
+	})...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -887,16 +1191,26 @@ func (r *wanResource) adoptExistingWAN(
 		return nil, fmt.Errorf("listing networks: %w", err)
 	}
 
+	// Match the WAN that owns the same network group we are creating (WAN, WAN2,
+	// …), not just the primary "WAN" — otherwise a WAN2 conflict adopts the wrong
+	// interface (#334).
+	wantGroup := "WAN"
+	if network.WANNetworkGroup != nil && *network.WANNetworkGroup != "" {
+		wantGroup = *network.WANNetworkGroup
+	}
 	var existing *unifi.Network
 	for _, n := range networks {
 		if n.Purpose == unifi.PurposeWAN && n.WANNetworkGroup != nil &&
-			*n.WANNetworkGroup == "WAN" {
+			*n.WANNetworkGroup == wantGroup {
 			existing = &n
 			break
 		}
 	}
 	if existing == nil {
-		return nil, fmt.Errorf("existing WAN network not found despite creation conflict")
+		return nil, fmt.Errorf(
+			"existing WAN network (group %s) not found despite creation conflict",
+			wantGroup,
+		)
 	}
 
 	network.ID = existing.ID
@@ -908,6 +1222,7 @@ func (r *wanResource) adoptExistingWAN(
 // For non-null config fields, we use the plan value (which includes any validation/transform).
 // For null config fields, we keep the state value (from the API).
 func (r *wanResource) overlayConfig(
+	ctx context.Context,
 	state *wanResourceModel,
 	config *wanResourceModel,
 	plan *wanResourceModel,
@@ -938,6 +1253,21 @@ func (r *wanResource) overlayConfig(
 	if !config.ProviderCapabilities.IsNull() {
 		state.ProviderCapabilities = plan.ProviderCapabilities
 	}
+	// setting_preference / ipv6_setting_preference are Computed: the controller
+	// may echo back "auto" in the create response even when the user asked for
+	// "manual". When the user explicitly set them, keep their value so the result
+	// stays consistent with the plan (mirrors applyPlanToState on the Update path).
+	if !config.SettingPreference.IsNull() {
+		state.SettingPreference = plan.SettingPreference
+	}
+	if !config.IPv6SettingPreference.IsNull() {
+		state.IPv6SettingPreference = plan.IPv6SettingPreference
+	}
+	// The controller can force dslite.remote_host_auto back to `true`
+	// server-side; re-assert each DS-Lite leaf the plan knows so the create
+	// result matches the plan (#281). A leaf not set in config is unknown in
+	// the create plan and so keeps the controller's value.
+	state.Dslite = util.OverlayKnownObject(ctx, plan.Dslite, state.Dslite)
 }
 
 func (r *wanResource) Read(
@@ -953,7 +1283,44 @@ func (r *wanResource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := state.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Read identity, falling back to state for resources created before
+	// identity support. When an identity comes in it must be passed through
+	// unchanged: Terraform treats any modification of a non-null identity
+	// (including filling a null attribute) as an error.
+	haveIdentity := req.Identity != nil && !req.Identity.Raw.IsNull()
+	var identity wanIdentityModel
+	if haveIdentity {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	} else {
+		identity.ID = state.ID
+		identity.Site = state.Site
+	}
+
+	// Tolerate identity-only state (the refresh right after an identity-based
+	// import): fill the missing lookup keys from identity.
+	id := ""
+	if !state.ID.IsNull() && !state.ID.IsUnknown() {
+		id = state.ID.ValueString()
+	}
+	if id == "" {
+		id = identity.ID.ValueString()
+	}
+
 	site := state.Site.ValueString()
+	if site == "" {
+		site = identity.Site.ValueString()
+	}
 	if site == "" {
 		site = r.client.Site
 	}
@@ -961,7 +1328,7 @@ func (r *wanResource) Read(
 	var network *unifi.Network
 	var err error
 
-	if state.ID.IsNull() || state.ID.IsUnknown() {
+	if id == "" {
 		network, err = r.client.GetNetworkByName(ctx, site, state.Name.ValueString())
 		if err != nil {
 			resp.Diagnostics.AddError(
@@ -972,7 +1339,7 @@ func (r *wanResource) Read(
 		}
 	} else {
 		// Get the network
-		network, err = r.client.GetNetwork(ctx, site, state.ID.ValueString())
+		network, err = r.client.GetNetwork(ctx, site, id)
 		if err != nil {
 			resp.Diagnostics.AddError(
 				"Client Error",
@@ -989,7 +1356,13 @@ func (r *wanResource) Read(
 		return
 	}
 
-	// Save updated data into Terraform state
+	// Save updated data into Terraform state. A pre-existing identity is
+	// re-set unchanged; a fresh one is derived from the refreshed state.
+	if !haveIdentity {
+		identity.ID = state.ID
+		identity.Site = state.Site
+	}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -1013,8 +1386,22 @@ func (r *wanResource) Update(
 		return
 	}
 
+	updateTimeout, timeoutDiags := plan.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
 	// Step 2: Apply the plan changes to the state object
 	r.applyPlanToState(ctx, &plan, &state)
+	state.Timeouts = plan.Timeouts
+
+	state.PasswordWO = r.readPasswordWO(ctx, req.Config, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Step 3: Convert the updated state to API format
 	network, diags := r.modelToNetwork(ctx, &state)
@@ -1046,13 +1433,32 @@ func (r *wanResource) Update(
 		return
 	}
 
-	// Save updated data into Terraform state
+	// Step 6: Re-assert the planned DS-Lite values. The controller overrides
+	// dslite.remote_host_auto server-side (it forces `true` when the AFTR is
+	// auto-detected for the interface), so the post-apply read returns `true`
+	// where the plan set `false` and the consistency check fails (#281). Keep
+	// the planned leaves the user set; the next Read reconciles state with the
+	// controller. (networkToModel runs after applyPlanToState, so its value
+	// would otherwise win.)
+	state.Dslite = util.OverlayKnownObject(ctx, plan.Dslite, state.Dslite)
+
+	// Save updated data into Terraform state. Identity is immutable once set:
+	// carry the incoming identity through unchanged, deriving a fresh one from
+	// state only when it was absent.
+	identity := wanIdentityModel{ID: state.ID, Site: state.Site}
+	if req.Identity != nil && !req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
 // applyPlanToState merges plan values into state, preserving state values where plan is null/unknown.
 func (r *wanResource) applyPlanToState(
-	_ context.Context,
+	ctx context.Context,
 	plan *wanResourceModel,
 	state *wanResourceModel,
 ) {
@@ -1117,12 +1523,9 @@ func (r *wanResource) applyPlanToState(
 	if !plan.MACOverrideEnabled.IsNull() && !plan.MACOverrideEnabled.IsUnknown() {
 		state.MACOverrideEnabled = plan.MACOverrideEnabled
 	}
-	if !plan.DsliteRemoteHost.IsNull() && !plan.DsliteRemoteHost.IsUnknown() {
-		state.DsliteRemoteHost = plan.DsliteRemoteHost
-	}
-	if !plan.DsliteRemoteHostAuto.IsNull() && !plan.DsliteRemoteHostAuto.IsUnknown() {
-		state.DsliteRemoteHostAuto = plan.DsliteRemoteHostAuto
-	}
+	// DS-Lite: re-assert every leaf the plan knows and keep the state's value
+	// for the rest, as the flat attributes were merged leaf by leaf.
+	state.Dslite = util.OverlayKnownObject(ctx, plan.Dslite, state.Dslite)
 }
 
 func (r *wanResource) Delete(
@@ -1137,6 +1540,14 @@ func (r *wanResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := state.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	site := state.Site.ValueString()
 	if site == "" {
@@ -1165,36 +1576,85 @@ func (r *wanResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	idParts := strings.Split(req.ID, ":")
-	if len(idParts) == 2 {
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), idParts[0])...)
-		req.ID = idParts[1]
+	// Import by ID string (terraform import CLI, or import block with id set).
+	// Formats: "site:id", "name=<name>", a bare 24-hex controller ObjectID, or
+	// a plain network name.
+	if req.ID != "" {
+		var site types.String
+
+		idParts := strings.Split(req.ID, ":")
+		if len(idParts) == 2 {
+			site = types.StringValue(idParts[0])
+			resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), site)...)
+			req.ID = idParts[1]
+		}
+
+		if strings.HasPrefix(req.ID, "name=") {
+			req.ID = strings.TrimPrefix(req.ID, "name=")
+			resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
+		} else if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(req.ID) {
+			identity := wanIdentityModel{ID: types.StringValue(req.ID), Site: site}
+			resp.Diagnostics.Append(
+				resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+			resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
+		} else {
+			// Fall back to importing by name.
+			resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
+		}
+		return
 	}
 
-	rootAttributeName := "name"
-	if strings.HasPrefix(req.ID, "name=") {
-		req.ID = strings.TrimPrefix(req.ID, "name=")
-	} else if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(req.ID) {
-		rootAttributeName = "id"
+	// Import by resource identity (import block with identity, Terraform 1.12+).
+	var identity wanIdentityModel
+	resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+	if resp.Diagnostics.HasError() {
+		return
 	}
 
-	resource.ImportStatePassthroughID(ctx, path.Root(rootAttributeName), req, resp)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+	if !identity.Site.IsNull() && identity.Site.ValueString() != "" {
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+	}
 }
 
 // modelToNetwork converts from Terraform model to unifi.Network.
 // Only fields with known values are set on the Network struct; null/unknown
 // fields are left as nil so marshalWAN omits them via omitempty.
+// readPasswordWO reads the write-only password_wo attribute. Write-only values
+// only ever appear in the request config, never in the plan or state, so they
+// have to be fetched explicitly and copied into the model before conversion.
+func (r *wanResource) readPasswordWO(
+	ctx context.Context,
+	config tfsdk.Config,
+	diags *diag.Diagnostics,
+) types.String {
+	var passwordWO types.String
+	diags.Append(config.GetAttribute(ctx, path.Root("password_wo"), &passwordWO)...)
+	return passwordWO
+}
+
 func (r *wanResource) modelToNetwork(
 	ctx context.Context,
 	model *wanResourceModel,
 ) (*unifi.Network, diag.Diagnostics) {
 	var diags diag.Diagnostics
 
+	// Preserve the interface's WAN network group (WAN, WAN2, …). Hard-coding "WAN"
+	// breaks a secondary uplink: its PUT collides with the primary WAN and the
+	// controller rejects it (WanConfigurationForNetworkGroupAlreadyExists) (#334).
+	// attr_hidden_id mirrors the group. Defaults to "WAN" via the schema default.
+	networkGroup := "WAN"
+	if !model.NetworkGroup.IsNull() && !model.NetworkGroup.IsUnknown() &&
+		model.NetworkGroup.ValueString() != "" {
+		networkGroup = model.NetworkGroup.ValueString()
+	}
+
 	network := &unifi.Network{
 		Name:            model.Name.ValueStringPointer(),
 		Purpose:         unifi.PurposeWAN, // Statically set to "wan"
-		WANNetworkGroup: util.Ptr("WAN"),  // Statically set to "WAN"
-		HiddenID:        "WAN",            // Statically set to "WAN"
+		WANNetworkGroup: new(networkGroup),
+		HiddenID:        networkGroup,
 		Enabled:         model.Enabled.ValueBool(),
 	}
 
@@ -1205,6 +1665,21 @@ func (r *wanResource) modelToNetwork(
 	}
 	if !model.TypeV6.IsNull() && !model.TypeV6.IsUnknown() {
 		network.WANTypeV6 = model.TypeV6.ValueStringPointer()
+	}
+
+	// PPPoE credentials. go-unifi models both as *string with omitempty, so an
+	// unset attribute keeps the key off the wire and the controller preserves
+	// the stored login - an imported PPPoE uplink can be managed for its other
+	// settings without wiping the ISP credentials (#515). password_wo is
+	// write-only, so it reaches modelToNetwork through the model only after
+	// Create/Update copy it in from the request config.
+	if !model.Username.IsNull() && !model.Username.IsUnknown() {
+		network.WANUsername = model.Username.ValueStringPointer()
+	}
+	if !model.Password.IsNull() && !model.Password.IsUnknown() {
+		network.WANPassword = model.Password.ValueStringPointer()
+	} else if !model.PasswordWO.IsNull() && !model.PasswordWO.IsUnknown() {
+		network.WANPassword = model.PasswordWO.ValueStringPointer()
 	}
 
 	// DNS Settings
@@ -1219,17 +1694,23 @@ func (r *wanResource) modelToNetwork(
 			if !dns.Secondary.IsNull() && !dns.Secondary.IsUnknown() {
 				network.WANDNS2 = dns.Secondary.ValueStringPointer()
 			}
-			if !dns.IPv6Primary.IsNull() && !dns.IPv6Primary.IsUnknown() {
-				network.WANIPV6DNS1 = dns.IPv6Primary.ValueStringPointer()
-			}
-			if !dns.IPv6Secondary.IsNull() && !dns.IPv6Secondary.IsUnknown() {
-				network.WANIPV6DNS2 = dns.IPv6Secondary.ValueStringPointer()
-			}
 			if !dns.Preference.IsNull() && !dns.Preference.IsUnknown() {
 				network.WANDNSPreference = dns.Preference.ValueStringPointer()
 			}
-			if !dns.IPv6Preference.IsNull() && !dns.IPv6Preference.IsUnknown() {
-				network.WANIPV6DNSPreference = dns.IPv6Preference.ValueStringPointer()
+			// A null/unknown ipv6 object contributes nothing, as its unset
+			// flat leaves did.
+			ipv6, ok, d := util.ObjectAs[dnsIPv6Model](ctx, dns.IPv6)
+			diags.Append(d...)
+			if ok {
+				if !ipv6.Primary.IsNull() && !ipv6.Primary.IsUnknown() {
+					network.WANIPV6DNS1 = ipv6.Primary.ValueStringPointer()
+				}
+				if !ipv6.Secondary.IsNull() && !ipv6.Secondary.IsUnknown() {
+					network.WANIPV6DNS2 = ipv6.Secondary.ValueStringPointer()
+				}
+				if !ipv6.Preference.IsNull() && !ipv6.Preference.IsUnknown() {
+					network.WANIPV6DNSPreference = ipv6.Preference.ValueStringPointer()
+				}
 			}
 		}
 	}
@@ -1291,11 +1772,15 @@ func (r *wanResource) modelToNetwork(
 			if !dhcpv6.CoS.IsNull() && !dhcpv6.CoS.IsUnknown() {
 				network.WANDHCPv6Cos = dhcpv6.CoS.ValueInt64Pointer()
 			}
-			if !dhcpv6.PDSize.IsNull() && !dhcpv6.PDSize.IsUnknown() {
-				network.WANDHCPv6PDSize = dhcpv6.PDSize.ValueInt64Pointer()
-			}
-			if !dhcpv6.PDSizeAuto.IsNull() && !dhcpv6.PDSizeAuto.IsUnknown() {
-				network.WANDHCPv6PDSizeAuto = dhcpv6.PDSizeAuto.ValueBool()
+			pd, ok, d := util.ObjectAs[dhcpv6PDModel](ctx, dhcpv6.PD)
+			diags.Append(d...)
+			if ok {
+				if !pd.Size.IsNull() && !pd.Size.IsUnknown() {
+					network.WANDHCPv6PDSize = pd.Size.ValueInt64Pointer()
+				}
+				if !pd.SizeAuto.IsNull() && !pd.SizeAuto.IsUnknown() {
+					network.WANDHCPv6PDSizeAuto = pd.SizeAuto.ValueBool()
+				}
 			}
 			if !dhcpv6.DelegationType.IsNull() && !dhcpv6.DelegationType.IsUnknown() {
 				network.IPV6WANDelegationType = dhcpv6.DelegationType.ValueStringPointer()
@@ -1401,11 +1886,15 @@ func (r *wanResource) modelToNetwork(
 	if !model.MACOverrideEnabled.IsNull() && !model.MACOverrideEnabled.IsUnknown() {
 		network.MACOverrideEnabled = model.MACOverrideEnabled.ValueBool()
 	}
-	if !model.DsliteRemoteHost.IsNull() && !model.DsliteRemoteHost.IsUnknown() {
-		network.WANDsliteRemoteHost = model.DsliteRemoteHost.ValueStringPointer()
-	}
-	if !model.DsliteRemoteHostAuto.IsNull() && !model.DsliteRemoteHostAuto.IsUnknown() {
-		network.WANDsliteRemoteHostAuto = model.DsliteRemoteHostAuto.ValueBool()
+	dslite, ok, d := util.ObjectAs[wanDsliteModel](ctx, model.Dslite)
+	diags.Append(d...)
+	if ok {
+		if !dslite.RemoteHost.IsNull() && !dslite.RemoteHost.IsUnknown() {
+			network.WANDsliteRemoteHost = dslite.RemoteHost.ValueStringPointer()
+		}
+		if !dslite.RemoteHostAuto.IsNull() && !dslite.RemoteHostAuto.IsUnknown() {
+			network.WANDsliteRemoteHostAuto = dslite.RemoteHostAuto.ValueBool()
+		}
 	}
 
 	// Convert IP aliases list
@@ -1431,6 +1920,18 @@ func (r *wanResource) modelToNetwork(
 	return network, diags
 }
 
+// dnsAddrValue maps a controller WAN DNS address pointer to a Terraform value,
+// treating both a nil pointer and an empty string as null. The DNS address
+// fields are Optional (not Computed), so when no server is configured the
+// controller persists and returns "" — which would otherwise conflict with the
+// planned null and fail the consistency check (#333).
+func dnsAddrValue(p *string) types.String {
+	if p == nil || *p == "" {
+		return types.StringNull()
+	}
+	return types.StringValue(*p)
+}
+
 // networkToModel converts from unifi.Network to Terraform model.
 func (r *wanResource) networkToModel(
 	ctx context.Context,
@@ -1444,7 +1945,24 @@ func (r *wanResource) networkToModel(
 	model.Site = types.StringValue(site)
 	model.Name = types.StringPointerValue(network.Name)
 
+	// Preserve the WAN network group (WAN, WAN2, …) so updates target the right
+	// interface instead of always defaulting to "WAN" (#334).
+	if network.WANNetworkGroup != nil && *network.WANNetworkGroup != "" {
+		model.NetworkGroup = types.StringValue(*network.WANNetworkGroup)
+	} else {
+		model.NetworkGroup = types.StringValue("WAN")
+	}
+
 	// WAN Type Settings — only overwrite when API returns a value
+	// username round-trips; the controller never returns the password, and a
+	// write-only password_wo must never be written to state, so both password
+	// attributes are left exactly as the configuration had them.
+	if network.WANUsername != nil && *network.WANUsername != "" {
+		model.Username = types.StringValue(*network.WANUsername)
+	} else {
+		model.Username = types.StringNull()
+	}
+
 	if network.WANType != nil {
 		model.Type = types.StringValue(*network.WANType)
 	}
@@ -1452,10 +1970,16 @@ func (r *wanResource) networkToModel(
 		model.TypeV6 = types.StringValue(*network.WANTypeV6)
 	}
 
-	// VLAN Settings
+	// VLAN Settings. The controller omits the VLAN id when no WAN VLAN is set;
+	// map it to the schema default (0) rather than null so an imported WAN plans
+	// clean without needing an apply (#262).
+	vlanID := int64(0)
+	if network.WANVLAN != nil {
+		vlanID = *network.WANVLAN
+	}
 	vlanValue := vlanModel{
 		Enabled: types.BoolValue(network.WANVLANEnabled),
-		ID:      types.Int64PointerValue(network.WANVLAN),
+		ID:      types.Int64Value(vlanID),
 	}
 	vlanObj, d := types.ObjectValueFrom(ctx, vlanValue.AttributeTypes(), vlanValue)
 	diags.Append(d...)
@@ -1495,23 +2019,30 @@ func (r *wanResource) networkToModel(
 			diags.Append(d...)
 		}
 		if network.WANDNS1 != nil {
-			currentDNS.Primary = types.StringValue(*network.WANDNS1)
+			currentDNS.Primary = dnsAddrValue(network.WANDNS1)
 		}
 		if network.WANDNS2 != nil {
-			currentDNS.Secondary = types.StringValue(*network.WANDNS2)
-		}
-		if network.WANIPV6DNS1 != nil {
-			currentDNS.IPv6Primary = types.StringValue(*network.WANIPV6DNS1)
-		}
-		if network.WANIPV6DNS2 != nil {
-			currentDNS.IPv6Secondary = types.StringValue(*network.WANIPV6DNS2)
+			currentDNS.Secondary = dnsAddrValue(network.WANDNS2)
 		}
 		if network.WANDNSPreference != nil {
 			currentDNS.Preference = types.StringValue(*network.WANDNSPreference)
 		}
-		if network.WANIPV6DNSPreference != nil {
-			currentDNS.IPv6Preference = types.StringValue(*network.WANIPV6DNSPreference)
+		// dns.ipv6 is rebuilt the same way: prior leaves first (none when the
+		// object was null or unknown), then what the controller returned. It
+		// is always a known object, as its flat leaves always existed.
+		currentIPv6, _, d := util.ObjectAs[dnsIPv6Model](ctx, currentDNS.IPv6)
+		diags.Append(d...)
+		if network.WANIPV6DNS1 != nil {
+			currentIPv6.Primary = dnsAddrValue(network.WANIPV6DNS1)
 		}
+		if network.WANIPV6DNS2 != nil {
+			currentIPv6.Secondary = dnsAddrValue(network.WANIPV6DNS2)
+		}
+		if network.WANIPV6DNSPreference != nil {
+			currentIPv6.Preference = types.StringValue(*network.WANIPV6DNSPreference)
+		}
+		currentDNS.IPv6, d = types.ObjectValueFrom(ctx, currentIPv6.AttributeTypes(), currentIPv6)
+		diags.Append(d...)
 		dnsObj, d := types.ObjectValueFrom(ctx, currentDNS.AttributeTypes(), currentDNS)
 		diags.Append(d...)
 		model.DNS = dnsObj
@@ -1561,10 +2092,16 @@ func (r *wanResource) networkToModel(
 		if network.WANDHCPv6Cos != nil {
 			currentDHCPv6.CoS = types.Int64Value(*network.WANDHCPv6Cos)
 		}
+		// dhcpv6.pd: prior leaves first, then the controller's values (size
+		// only when returned, size_auto always, as before).
+		currentPD, _, d := util.ObjectAs[dhcpv6PDModel](ctx, currentDHCPv6.PD)
+		diags.Append(d...)
 		if network.WANDHCPv6PDSize != nil {
-			currentDHCPv6.PDSize = types.Int64Value(*network.WANDHCPv6PDSize)
+			currentPD.Size = types.Int64Value(*network.WANDHCPv6PDSize)
 		}
-		currentDHCPv6.PDSizeAuto = types.BoolValue(network.WANDHCPv6PDSizeAuto)
+		currentPD.SizeAuto = types.BoolValue(network.WANDHCPv6PDSizeAuto)
+		currentDHCPv6.PD, d = types.ObjectValueFrom(ctx, currentPD.AttributeTypes(), currentPD)
+		diags.Append(d...)
 		if network.IPV6WANDelegationType != nil {
 			currentDHCPv6.DelegationType = types.StringValue(*network.IPV6WANDelegationType)
 		}
@@ -1685,8 +2222,12 @@ func (r *wanResource) networkToModel(
 	model.IPv6SettingPreference = types.StringPointerValue(network.IPV6SettingPreference)
 	model.SingleNetworkLAN = types.StringPointerValue(network.SingleNetworkLan)
 	model.MACOverrideEnabled = types.BoolValue(network.MACOverrideEnabled)
-	model.DsliteRemoteHost = types.StringPointerValue(network.WANDsliteRemoteHost)
-	model.DsliteRemoteHostAuto = types.BoolValue(network.WANDsliteRemoteHostAuto)
+	dsliteObj, d := types.ObjectValueFrom(ctx, wanDsliteModel{}.AttributeTypes(), wanDsliteModel{
+		RemoteHost:     types.StringPointerValue(network.WANDsliteRemoteHost),
+		RemoteHostAuto: types.BoolValue(network.WANDsliteRemoteHostAuto),
+	})
+	diags.Append(d...)
+	model.Dslite = dsliteObj
 
 	// Convert IP aliases to list
 	if len(network.WANIPAliases) > 0 {
@@ -1781,8 +2322,124 @@ func applyWANDefaults(model *wanResourceModel) {
 	if model.IGMPProxy.IsNull() || model.IGMPProxy.IsUnknown() {
 		model.IGMPProxy = types.ObjectNull(igmpProxyModel{}.AttributeTypes())
 	}
+	if model.Dslite.IsNull() || model.Dslite.IsUnknown() {
+		model.Dslite = types.ObjectNull(wanDsliteModel{}.AttributeTypes())
+	}
 	// List types need properly-typed null values
 	if model.IPAliases.IsNull() || model.IPAliases.IsUnknown() {
 		model.IPAliases = types.ListNull(types.StringType)
+	}
+}
+
+// ListResourceConfigSchema implements [list.ListResource].
+func (r *wanResource) ListResourceConfigSchema(
+	_ context.Context,
+	_ list.ListResourceSchemaRequest,
+	resp *list.ListResourceSchemaResponse,
+) {
+	resp.Schema = listschema.Schema{
+		MarkdownDescription: "List WAN networks in a site.",
+		Attributes: map[string]listschema.Attribute{
+			"site": listschema.StringAttribute{
+				MarkdownDescription: "The name of the site to list WAN networks from.",
+				Optional:            true,
+			},
+		},
+		Blocks: map[string]listschema.Block{
+			"filter": listschema.ListNestedBlock{
+				NestedObject: listschema.NestedBlockObject{
+					Attributes: map[string]listschema.Attribute{
+						"name": listschema.StringAttribute{
+							MarkdownDescription: "The name of the filter to apply. Supported values are: `name`.",
+							Required:            true,
+						},
+						"value": listschema.StringAttribute{
+							MarkdownDescription: "The value to filter by.",
+							Required:            true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// List implements [list.ListResource].
+func (r *wanResource) List(
+	ctx context.Context,
+	req list.ListRequest,
+	stream *list.ListResultsStream,
+) {
+	var config wanListConfigModel
+
+	diags := req.Config.Get(ctx, &config)
+	if diags.HasError() {
+		stream.Results = list.ListResultsStreamDiagnostics(diags)
+		return
+	}
+
+	site := config.Site.ValueString()
+	if site == "" {
+		site = r.client.Site
+	}
+
+	// Process filter blocks.
+	var filters []wanListFilterModel
+	if !config.Filter.IsNull() && !config.Filter.IsUnknown() {
+		config.Filter.ElementsAs(ctx, &filters, false)
+	}
+
+	postFilters := make(map[string]string)
+	for _, f := range filters {
+		postFilters[f.Name.ValueString()] = f.Value.ValueString()
+	}
+
+	networks, err := r.client.ListNetwork(ctx, site)
+	if err != nil {
+		var d diag.Diagnostics
+		d.AddError("Error Listing WAN Networks", "Could not list WAN networks: "+err.Error())
+		stream.Results = list.ListResultsStreamDiagnostics(d)
+		return
+	}
+
+	stream.Results = func(push func(list.ListResult) bool) {
+		for _, network := range networks {
+			// Filter to only WAN networks.
+			if network.Purpose != unifi.PurposeWAN || network.WANNetworkGroup == nil {
+				continue
+			}
+
+			// Apply name filter if specified.
+			if nameFilter, ok := postFilters["name"]; ok {
+				if network.Name == nil || *network.Name != nameFilter {
+					continue
+				}
+			}
+
+			result := req.NewListResult(ctx)
+			if network.Name != nil {
+				result.DisplayName = *network.Name
+			}
+
+			// Set identity.
+			result.Diagnostics.Append(
+				result.Identity.Set(ctx, wanIdentityModel{
+					ID:   types.StringValue(network.ID),
+					Site: types.StringValue(site),
+				})...,
+			)
+
+			// Convert to model.
+			var model wanResourceModel
+			result.Diagnostics.Append(r.networkToModel(ctx, &network, &model, site)...)
+			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
+				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
+			}
+
+			if !push(result) {
+				return
+			}
+		}
 	}
 }

@@ -1,8 +1,10 @@
 package unifi
 
 import (
+	"context"
 	"testing"
 
+	fwdatasource "github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 )
 
@@ -27,7 +29,7 @@ func TestAccRadiusProfileDataSource_basic(t *testing.T) {
 					),
 					resource.TestCheckResourceAttr(
 						"data.unifi_radius_profile.test",
-						"interim_update_enabled",
+						"interim_update.enabled",
 						"false",
 					),
 					resource.TestCheckResourceAttr(
@@ -42,13 +44,13 @@ func TestAccRadiusProfileDataSource_basic(t *testing.T) {
 					),
 					resource.TestCheckResourceAttr(
 						"data.unifi_radius_profile.test",
-						"vlan_enabled",
+						"vlan.enabled",
 						"false",
 					),
 					resource.TestCheckResourceAttrSet("data.unifi_radius_profile.test", "site"),
 					resource.TestCheckResourceAttrSet(
 						"data.unifi_radius_profile.test",
-						"interim_update_interval",
+						"interim_update.interval",
 					),
 				),
 			},
@@ -93,13 +95,13 @@ func TestAccRadiusProfileDataSource_accountingEnabled(t *testing.T) {
 					),
 					resource.TestCheckResourceAttr(
 						"data.unifi_radius_profile.test",
-						"interim_update_enabled",
+						"interim_update.enabled",
 						"true",
 					),
 					resource.TestCheckResourceAttr(
 						"data.unifi_radius_profile.test",
-						"interim_update_interval",
-						"900",
+						"interim_update.interval",
+						"15m0s",
 					),
 				),
 			},
@@ -143,10 +145,13 @@ data "unifi_radius_profile" "test" {
 func testAccRadiusProfileDataSourceConfig_accountingEnabled() string {
 	return `
 resource "unifi_radius_profile" "test" {
-  name                    = "tfacc-radius-profile-ds-acct"
-  accounting_enabled      = true
-  interim_update_enabled  = true
-  interim_update_interval = 900
+  name               = "tfacc-radius-profile-ds-acct"
+  accounting_enabled = true
+
+  interim_update = {
+    enabled  = true
+    interval = "15m0s"
+  }
 }
 
 data "unifi_radius_profile" "test" {
@@ -155,4 +160,90 @@ data "unifi_radius_profile" "test" {
   depends_on = [unifi_radius_profile.test]
 }
 `
+}
+
+func TestNewRadiusProfileDataSource(t *testing.T) {
+	d := NewRadiusProfileDataSource()
+	if d == nil {
+		t.Fatal("NewRadiusProfileDataSource() returned nil")
+	}
+	if _, ok := d.(fwdatasource.DataSourceWithConfigure); !ok {
+		t.Error("expected DataSourceWithConfigure interface")
+	}
+}
+
+func Test_radiusProfileDataSource_Metadata(t *testing.T) {
+	tests := []struct {
+		providerTypeName string
+		wantTypeName     string
+	}{
+		{"unifi", "unifi_radius_profile"},
+		{"test", "test_radius_profile"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.providerTypeName, func(t *testing.T) {
+			d := &radiusProfileDataSource{}
+			resp := &fwdatasource.MetadataResponse{}
+			d.Metadata(
+				context.Background(),
+				fwdatasource.MetadataRequest{ProviderTypeName: tt.providerTypeName},
+				resp,
+			)
+			if resp.TypeName != tt.wantTypeName {
+				t.Errorf("TypeName = %q, want %q", resp.TypeName, tt.wantTypeName)
+			}
+		})
+	}
+}
+
+func Test_radiusProfileDataSource_Schema(t *testing.T) {
+	d := &radiusProfileDataSource{}
+	resp := &fwdatasource.SchemaResponse{}
+	d.Schema(context.Background(), fwdatasource.SchemaRequest{}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Errorf("Schema() produced errors: %v", resp.Diagnostics)
+	}
+	for _, name := range []string{
+		"id", "site", "name", "accounting_enabled", "interim_update", "vlan",
+	} {
+		if _, ok := resp.Schema.Attributes[name]; !ok {
+			t.Errorf("missing attribute %q", name)
+		}
+	}
+	for _, flat := range []string{
+		"interim_update_enabled", "interim_update_interval", "vlan_enabled", "vlan_wlan_mode",
+	} {
+		if _, ok := resp.Schema.Attributes[flat]; ok {
+			t.Errorf("flat attribute %q should have been nested", flat)
+		}
+	}
+}
+
+func Test_radiusProfileDataSource_Configure(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      any
+		wantError bool
+	}{
+		{"nil provider data", nil, false},
+		{"wrong type", "wrong", true},
+		{"correct client type", &Client{Site: "default"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			d := &radiusProfileDataSource{}
+			resp := &fwdatasource.ConfigureResponse{}
+			d.Configure(
+				context.Background(),
+				fwdatasource.ConfigureRequest{ProviderData: tt.data},
+				resp,
+			)
+			if tt.wantError && !resp.Diagnostics.HasError() {
+				t.Error("expected error in diagnostics")
+			}
+			if !tt.wantError && resp.Diagnostics.HasError() {
+				t.Errorf("unexpected error: %v", resp.Diagnostics)
+			}
+		})
+	}
 }

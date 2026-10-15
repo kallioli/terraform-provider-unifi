@@ -40,22 +40,61 @@ resource "unifi_device" "us_24_poe" {
   name = "Switch with POE"
 
   port_override {
-    number          = 1
+    index           = 1
     name            = "port w/ poe"
     port_profile_id = unifi_port_profile.poe.id
+    poe_mode        = "auto" # auto, pasv24, passthrough, off
   }
 
   port_override {
-    number          = 2
+    index           = 2
     name            = "disabled"
     port_profile_id = data.unifi_port_profile.disabled.id
   }
 
-  # port aggregation for ports 11 and 12
+  # Link aggregation: port 11 is the aggregate lead, bonding member port 12.
   port_override {
-    number              = 11
-    op_mode             = "aggregate"
-    aggregate_num_ports = 2
+    index             = 11
+    op_mode           = "aggregate" # switch, mirror, aggregate
+    aggregate_members = [12]
+  }
+}
+
+# Grouped settings: LED, spanning tree and the per-port feature groups are
+# nested objects rather than prefixed attributes.
+resource "unifi_device" "us_8_60w" {
+  mac  = "01:23:45:67:89:AC"
+  name = "Rack switch"
+
+  led = {
+    override   = "on"
+    color      = "#00ff00"
+    brightness = 50
+  }
+
+  stp = {
+    version  = "rstp"
+    priority = 4096
+  }
+
+  port_override {
+    index = 1
+    name  = "camera"
+
+    dot1x = {
+      ctrl = "force_authorized"
+    }
+    port_security = {
+      enabled     = true
+      mac_address = ["aa:bb:cc:dd:ee:01"]
+    }
+    stormctrl = {
+      type = "level"
+      bcast = {
+        enabled = true
+        level   = 50
+      }
+    }
   }
 }
 ```
@@ -72,29 +111,23 @@ resource "unifi_device" "us_24_poe" {
 - `flowctrl_enabled` (Boolean) Enable flow control.
 - `forget_on_destroy` (Boolean) Specifies whether this resource should tell the controller to forget the device on destroy.
 - `jumboframe_enabled` (Boolean) Enable jumbo frames.
-- `lcm_brightness` (Number) LCM brightness (1-100).
-- `lcm_brightness_override` (Boolean) Override LCM brightness.
-- `lcm_idle_timeout` (Number) LCM idle timeout in seconds (10-3600).
-- `lcm_idle_timeout_override` (Boolean) Override LCM idle timeout.
-- `lcm_night_mode_begins` (String) LCM night mode begin time (HH:MM format).
-- `lcm_night_mode_ends` (String) LCM night mode end time (HH:MM format).
-- `led_override` (String) LED override setting; valid values are `default`, `on`, and `off`.
-- `led_override_color` (String) LED color override (hex color code).
-- `led_override_color_brightness` (Number) LED brightness (0-100).
+- `lcm` (Attributes) LCD/display (LCM) settings for devices with a screen. (see [below for nested schema](#nestedatt--lcm))
+- `led` (Attributes) LED settings. (see [below for nested schema](#nestedatt--led))
 - `locked` (Boolean) Specifies whether the device is locked.
 - `mac` (String) The MAC address of the device. This can be specified so that the provider can take control of a device (since devices are created through adoption).
-- `mgmt_network_id` (String) Management network ID.
+- `mesh_sta_vap_enabled` (Boolean) Enable the mesh station VAP (the UI "Mesh Connect" toggle), letting this AP uplink wirelessly to a mesh parent.
+- `mgmt_network_id` (String) Management network ID. The network this device uses for its own management traffic (the UI's Network Override). When set, the device tags its management onto this network's VLAN, so that VLAN must already be tagged on the device's upstream switch port(s) before this attribute is applied. Otherwise the device loses its management path, drops off, and the apply fails with an inconsistent-result error. Apply in two steps: tag the VLAN on the uplink (a port_override tagged_networkconf_ids entry) first, then set mgmt_network_id. Leave unset to manage on the uplink's native (untagged) network.
 - `name` (String) The name of the device.
 - `outdoor_mode_override` (String) Outdoor mode override; valid values are `default`, `on`, and `off`.
 - `outlet_enabled` (Boolean) Enable outlet control.
 - `outlet_overrides` (Attributes List) Outlet configuration overrides. (see [below for nested schema](#nestedatt--outlet_overrides))
 - `poe_mode` (String) PoE mode; valid values are `auto`, `pasv24`, `passthrough`, and `off`.
-- `port_override` (Block Set) Settings overrides for specific switch ports. (see [below for nested schema](#nestedblock--port_override))
+- `port_override` (Block Set) Per-port settings overrides, applied only to the ports you declare. Ports without a `port_override` block keep their existing controller-side configuration — the provider merges your declared ports (by `index`) into the device's current overrides rather than replacing the whole set. Removing a block stops managing that port but does not reset it; clear a port by overriding it back to the defaults instead. (see [below for nested schema](#nestedblock--port_override))
 - `radio_table` (Attributes List) Radio configuration table. (see [below for nested schema](#nestedatt--radio_table))
 - `site` (String) The name of the site to associate the device with.
-- `stp_priority` (Number) STP priority.
-- `stp_version` (String) STP version; valid values are `stp`, `rstp`, and `disabled`.
+- `stp` (Attributes) Spanning Tree Protocol (STP) settings. (see [below for nested schema](#nestedatt--stp))
 - `switch_vlan_enabled` (Boolean) Enable VLAN support on the switch.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 - `volume` (Number) Volume level (0-100).
 - `x_baresip_password` (String, Sensitive) Baresip password.
 
@@ -119,6 +152,37 @@ Optional:
 - `ip` (String) IP address (for static configuration).
 - `netmask` (String) Network mask (for static configuration).
 - `type` (String) Network configuration type (dhcp or static).
+
+
+<a id="nestedatt--lcm"></a>
+### Nested Schema for `lcm`
+
+Optional:
+
+- `brightness` (Number) LCM brightness (1-100).
+- `brightness_override` (Boolean) Override the site-wide LCM brightness with `brightness`.
+- `idle_timeout` (String) LCM idle timeout, as a Go duration string (e.g. `10m`, `600s`).
+- `idle_timeout_override` (Boolean) Override the site-wide LCM idle timeout with `idle_timeout`.
+- `night_mode` (Attributes) Window during which the display is dimmed. (see [below for nested schema](#nestedatt--lcm--night_mode))
+
+<a id="nestedatt--lcm--night_mode"></a>
+### Nested Schema for `lcm.night_mode`
+
+Optional:
+
+- `begins` (String) Night mode start time, 24-hour `HH:MM`.
+- `ends` (String) Night mode end time, 24-hour `HH:MM`.
+
+
+
+<a id="nestedatt--led"></a>
+### Nested Schema for `led`
+
+Optional:
+
+- `brightness` (Number) LED brightness (0-100).
+- `color` (String) LED color override (hex color code).
+- `override` (String) LED override setting; valid values are `default`, `on`, and `off`.
 
 
 <a id="nestedatt--outlet_overrides"></a>
@@ -146,48 +210,112 @@ Optional:
 
 - `aggregate_members` (List of Number) Port indices that make up this link-aggregation (LAG) group. Only takes effect when `op_mode` is `aggregate` on this port.
 - `autoneg` (Boolean) Enable auto-negotiation for port speed.
-- `dot1x_ctrl` (String) 802.1X control mode.
-- `dot1x_idle_timeout` (Number) 802.1X idle timeout in seconds.
-- `egress_rate_limit_kbps` (Number) Egress rate limit in kbps.
-- `egress_rate_limit_kbps_enabled` (Boolean) Enable egress rate limiting.
-- `excluded_networkconf_ids` (List of String) List of network IDs to exclude from this port.
+- `dot1x` (Attributes) 802.1X port authentication settings. (see [below for nested schema](#nestedatt--port_override--dot1x))
+- `egress_rate_limit` (Attributes) Egress rate limiting. (see [below for nested schema](#nestedatt--port_override--egress_rate_limit))
+- `excluded_networkconf_ids` (Set of String) List of network IDs to exclude from this port.
 - `fec_mode` (String) Forward Error Correction mode.
 - `flow_control_enabled` (Boolean) Enable flow control.
 - `forward` (String) Forwarding mode.
 - `full_duplex` (Boolean) Enable full duplex mode.
 - `isolation` (Boolean) Enable port isolation.
-- `lldpmed_enabled` (Boolean) Enable LLDP-MED.
-- `lldpmed_notify_enabled` (Boolean) Enable LLDP-MED notifications.
+- `lldpmed` (Attributes) LLDP-MED settings. (see [below for nested schema](#nestedatt--port_override--lldpmed))
 - `mirror_port_idx` (Number) Mirror port index.
-- `multicast_router_networkconf_ids` (List of String) List of network IDs for multicast router.
+- `multicast_router_networkconf_ids` (Set of String) List of network IDs for multicast router.
 - `name` (String) Human-readable name of the port.
 - `native_networkconf_id` (String) Native network ID (VLAN).
 - `op_mode` (String) Operating mode of the port: `switch` (default), `mirror`, or `aggregate`. Set `aggregate` on the lead port of an SFP+/link-aggregation (LAG) group and list the member ports in `aggregate_members`. Only written when not `switch`, as gateway devices (UDM) reject op_mode on update.
 - `poe_mode` (String) PoE mode of the port; valid values are `auto`, `pasv24`, `passthrough`, and `off`.
 - `port_keepalive_enabled` (Boolean) Enable port keepalive.
 - `port_profile_id` (String) ID of the Port Profile used on this port.
-- `port_security_enabled` (Boolean) Enable port security.
-- `port_security_mac_address` (List of String) List of MAC addresses allowed when port security is enabled.
+- `port_security` (Attributes) Port security (MAC allow-list) settings. (see [below for nested schema](#nestedatt--port_override--port_security))
 - `priority_queue1_level` (Number) Priority queue 1 level.
 - `priority_queue2_level` (Number) Priority queue 2 level.
 - `priority_queue3_level` (Number) Priority queue 3 level.
 - `priority_queue4_level` (Number) Priority queue 4 level.
 - `setting_preference` (String) Setting preference.
 - `speed` (Number) Port speed in Mbps.
-- `stormctrl_bcast_enabled` (Boolean) Enable broadcast storm control.
-- `stormctrl_bcast_level` (Number) Broadcast storm control level.
-- `stormctrl_bcast_rate` (Number) Broadcast storm control rate.
-- `stormctrl_mcast_enabled` (Boolean) Enable multicast storm control.
-- `stormctrl_mcast_level` (Number) Multicast storm control level.
-- `stormctrl_mcast_rate` (Number) Multicast storm control rate.
-- `stormctrl_type` (String) Storm control type.
-- `stormctrl_ucast_enabled` (Boolean) Enable unicast storm control.
-- `stormctrl_ucast_level` (Number) Unicast storm control level.
-- `stormctrl_ucast_rate` (Number) Unicast storm control rate.
+- `stormctrl` (Attributes) Storm control settings. (see [below for nested schema](#nestedatt--port_override--stormctrl))
 - `stp_port_mode` (Boolean) STP port mode.
-- `tagged_networkconf_ids` (List of String) List of network IDs to tag on this port.
+- `tagged_networkconf_ids` (Set of String) List of network IDs to tag on this port.
 - `tagged_vlan_mgmt` (String) Tagged VLAN management.
 - `voice_networkconf_id` (String) Voice network ID.
+
+<a id="nestedatt--port_override--dot1x"></a>
+### Nested Schema for `port_override.dot1x`
+
+Optional:
+
+- `ctrl` (String) 802.1X control mode.
+- `idle_timeout` (String) 802.1X idle timeout, as a Go duration string (e.g. `5m`, `300s`).
+
+
+<a id="nestedatt--port_override--egress_rate_limit"></a>
+### Nested Schema for `port_override.egress_rate_limit`
+
+Optional:
+
+- `enabled` (Boolean) Enable egress rate limiting.
+- `kbps` (Number) Egress rate limit in kbps.
+
+
+<a id="nestedatt--port_override--lldpmed"></a>
+### Nested Schema for `port_override.lldpmed`
+
+Optional:
+
+- `enabled` (Boolean) Enable LLDP-MED.
+- `notify_enabled` (Boolean) Enable LLDP-MED topology change notifications.
+
+
+<a id="nestedatt--port_override--port_security"></a>
+### Nested Schema for `port_override.port_security`
+
+Optional:
+
+- `enabled` (Boolean) Enable port security.
+- `mac_address` (List of String) List of MAC addresses allowed when port security is enabled.
+
+
+<a id="nestedatt--port_override--stormctrl"></a>
+### Nested Schema for `port_override.stormctrl`
+
+Optional:
+
+- `bcast` (Attributes) Broadcast storm control. (see [below for nested schema](#nestedatt--port_override--stormctrl--bcast))
+- `mcast` (Attributes) Multicast storm control. (see [below for nested schema](#nestedatt--port_override--stormctrl--mcast))
+- `type` (String) Storm control type; `level` or `rate`.
+- `ucast` (Attributes) Unknown unicast storm control. (see [below for nested schema](#nestedatt--port_override--stormctrl--ucast))
+
+<a id="nestedatt--port_override--stormctrl--bcast"></a>
+### Nested Schema for `port_override.stormctrl.bcast`
+
+Optional:
+
+- `enabled` (Boolean) Enable Broadcast storm control.
+- `level` (Number) Broadcast storm control level (percent), used when `type` is `level`.
+- `rate` (Number) Broadcast storm control rate (packets per second), used when `type` is `rate`.
+
+
+<a id="nestedatt--port_override--stormctrl--mcast"></a>
+### Nested Schema for `port_override.stormctrl.mcast`
+
+Optional:
+
+- `enabled` (Boolean) Enable Multicast storm control.
+- `level` (Number) Multicast storm control level (percent), used when `type` is `level`.
+- `rate` (Number) Multicast storm control rate (packets per second), used when `type` is `rate`.
+
+
+<a id="nestedatt--port_override--stormctrl--ucast"></a>
+### Nested Schema for `port_override.stormctrl.ucast`
+
+Optional:
+
+- `enabled` (Boolean) Enable Unknown unicast storm control.
+- `level` (Number) Unknown unicast storm control level (percent), used when `type` is `level`.
+- `rate` (Number) Unknown unicast storm control rate (packets per second), used when `type` is `rate`.
+
+
 
 
 <a id="nestedatt--radio_table"></a>
@@ -197,8 +325,8 @@ Optional:
 
 - `antenna_gain` (Number) Antenna gain.
 - `antenna_id` (Number) Antenna ID.
-- `assisted_roaming_enabled` (Boolean) Enable assisted roaming.
-- `assisted_roaming_rssi` (Number) Assisted roaming RSSI threshold.
+- `assisted_roaming_enabled` (Boolean, Deprecated) **Moved to `unifi_wlan.roaming_assistant_na.enabled`** (and `roaming_assistant_6e.enabled` for 6 GHz). UniFi Network 10.x moved assisted roaming from the device's radio table onto the WLAN, so this attribute no longer reaches the controller. Still accepted and preserved in state for one release.
+- `assisted_roaming_rssi` (Number, Deprecated) **Moved to `unifi_wlan.roaming_assistant_na.rssi`** (and `roaming_assistant_6e.rssi` for 6 GHz). UniFi Network 10.x moved assisted roaming from the device's radio table onto the WLAN, so this attribute no longer reaches the controller. Still accepted and preserved in state for one release.
 - `channel` (String) Channel number or 'auto'.
 - `dfs` (Boolean) Enable DFS (Dynamic Frequency Selection).
 - `hard_noise_floor_enabled` (Boolean) Enable hard noise floor.
@@ -214,3 +342,23 @@ Optional:
 - `tx_power` (String) Transmit power or 'auto'.
 - `tx_power_mode` (String) Transmit power mode (auto, medium, high, low, custom).
 - `vwire_enabled` (Boolean) Enable virtual wire.
+
+
+<a id="nestedatt--stp"></a>
+### Nested Schema for `stp`
+
+Optional:
+
+- `priority` (Number) STP bridge priority.
+- `version` (String) STP version; valid values are `stp`, `rstp`, and `disabled`.
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).

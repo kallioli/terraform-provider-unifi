@@ -4,17 +4,24 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/listvalidator"
+	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
+	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/listdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/ubiquiti-community/go-unifi/unifi"
 	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/validators"
@@ -24,15 +31,35 @@ import (
 var (
 	_ resource.Resource                = &wireguardPeerResource{}
 	_ resource.ResourceWithImportState = &wireguardPeerResource{}
+	_ resource.ResourceWithIdentity    = &wireguardPeerResource{}
+)
+
+// Ensure provider defined types fully satisfy list interfaces.
+var (
+	_ list.ListResource              = &wireguardPeerResource{}
+	_ list.ListResourceWithConfigure = &wireguardPeerResource{}
 )
 
 func NewWireguardPeerResource() resource.Resource {
 	return &wireguardPeerResource{}
 }
 
+func NewWireguardPeerListResource() list.ListResource {
+	return &wireguardPeerResource{}
+}
+
 // wireguardPeerResource defines the resource implementation.
 type wireguardPeerResource struct {
 	client *Client
+}
+
+// wireguardPeerIdentityModel describes the resource identity data model.
+// Peers live under a WireGuard server network, so locating one requires the
+// network ID in addition to the peer ID.
+type wireguardPeerIdentityModel struct {
+	ID        types.String `tfsdk:"id"`
+	NetworkID types.String `tfsdk:"network_id"`
+	Site      types.String `tfsdk:"site"`
 }
 
 // wireguardPeerResourceModel describes the resource data model.
@@ -44,6 +71,24 @@ type wireguardPeerResourceModel struct {
 	InterfaceIP types.String `tfsdk:"interface_ip"`
 	PublicKey   types.String `tfsdk:"public_key"`
 	AllowedIPs  types.List   `tfsdk:"allowed_ips"`
+
+	PresharedKey   types.String   `tfsdk:"preshared_key"`
+	PresharedKeyWO types.String   `tfsdk:"preshared_key_wo"`
+	Timeouts       timeouts.Value `tfsdk:"timeouts"`
+}
+
+// wireguardPeerListConfigModel describes the list configuration model. Peers
+// belong to a WireGuard server network, so `network_id` is required.
+type wireguardPeerListConfigModel struct {
+	Site      types.String `tfsdk:"site"`
+	NetworkID types.String `tfsdk:"network_id"`
+	Filter    types.List   `tfsdk:"filter"`
+}
+
+// wireguardPeerListFilterModel represents a single name/value filter entry.
+type wireguardPeerListFilterModel struct {
+	Name  types.String `tfsdk:"name"`
+	Value types.String `tfsdk:"value"`
 }
 
 func (r *wireguardPeerResource) Metadata(
@@ -52,6 +97,41 @@ func (r *wireguardPeerResource) Metadata(
 	resp *resource.MetadataResponse,
 ) {
 	resp.TypeName = req.ProviderTypeName + "_wireguard_peer"
+}
+
+// IdentitySchema implements [resource.ResourceWithIdentity].
+func (r *wireguardPeerResource) IdentitySchema(
+	_ context.Context,
+	_ resource.IdentitySchemaRequest,
+	resp *resource.IdentitySchemaResponse,
+) {
+	resp.IdentitySchema = identityschema.Schema{
+		Version: 1,
+		Attributes: map[string]identityschema.Attribute{
+			"id": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+			// The controller only exposes peers under their WireGuard server
+			// network, so the network ID is required to locate a peer.
+			"network_id": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+			"site": identityschema.StringAttribute{
+				OptionalForImport: true,
+			},
+		},
+	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity]. See
+// siteIdentityUpgraders. A version 0 identity written before v0.56.0 is {id}
+// only, and an identity upgrader sees the stored identity but not state, so
+// network_id stays null for those peers. Read still locates the peer, because
+// it takes network_id from state first.
+func (r *wireguardPeerResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return siteIdentityUpgraders(func() *Client { return r.client })
 }
 
 func (r *wireguardPeerResource) Schema(
@@ -104,6 +184,35 @@ func (r *wireguardPeerResource) Schema(
 				MarkdownDescription: "The WireGuard public key of the peer.",
 				Required:            true,
 			},
+			"preshared_key": schema.StringAttribute{
+				MarkdownDescription: "Optional WireGuard pre-shared key for this peer " +
+					"(the UI's Pre-Shared Key toggle), adding a layer of symmetric " +
+					"encryption on top of the key pair. The controller stores and " +
+					"returns it in clear text, so it is kept in state - use " +
+					"`preshared_key_wo` to avoid persisting the secret. Left unset, " +
+					"the attribute is not written and a key configured out of band is " +
+					"preserved.",
+				Optional:  true,
+				Sensitive: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+					stringvalidator.ConflictsWith(path.MatchRoot("preshared_key_wo")),
+				},
+			},
+			"preshared_key_wo": schema.StringAttribute{
+				MarkdownDescription: "Write-only equivalent of `preshared_key` " +
+					"(Terraform 1.11+). Used at apply time but never written to state, " +
+					"so it can be sourced from an ephemeral resource. Because nothing " +
+					"is stored, the provider cannot detect a key changed outside " +
+					"Terraform: such a change produces no diff. Mutually exclusive " +
+					"with `preshared_key`.",
+				Optional:  true,
+				Sensitive: true,
+				WriteOnly: true,
+				Validators: []validator.String{
+					stringvalidator.LengthAtLeast(1),
+				},
+			},
 			"allowed_ips": schema.ListAttribute{
 				MarkdownDescription: "Additional CIDRs routed to this peer beyond its tunnel IP.",
 				ElementType:         types.StringType,
@@ -116,6 +225,12 @@ func (r *wireguardPeerResource) Schema(
 					listvalidator.ValueStringsAre(validators.CIDRValidator()),
 				},
 			},
+			"timeouts": timeouts.Attributes(ctx, timeouts.Opts{
+				Create: true,
+				Read:   true,
+				Update: true,
+				Delete: true,
+			}),
 		},
 	}
 }
@@ -156,6 +271,19 @@ func (r *wireguardPeerResource) Create(
 		return
 	}
 
+	createTimeout, timeoutDiags := data.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
+	data.PresharedKeyWO = r.readPresharedKeyWO(ctx, req.Config, &resp.Diagnostics)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
 	peer, diags := r.modelToPeer(ctx, &data)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -177,6 +305,12 @@ func (r *wireguardPeerResource) Create(
 	}
 
 	resp.Diagnostics.Append(r.peerToModel(ctx, createdPeer, &data, site)...)
+	identity := wireguardPeerIdentityModel{
+		ID:        data.ID,
+		NetworkID: data.NetworkID,
+		Site:      data.Site,
+	}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -192,17 +326,60 @@ func (r *wireguardPeerResource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Read identity, falling back to state for resources created before
+	// identity support. When an identity comes in it must be passed through
+	// unchanged: Terraform treats any modification of a non-null identity
+	// (including filling a null attribute) as an error.
+	haveIdentity := req.Identity != nil && !req.Identity.Raw.IsNull()
+	var identity wireguardPeerIdentityModel
+	if haveIdentity {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	} else {
+		identity.ID = data.ID
+		identity.NetworkID = data.NetworkID
+		identity.Site = data.Site
+	}
+
+	// Tolerate identity-only state (the refresh right after an identity-based
+	// import): fill the missing lookup keys from identity.
+	id := data.ID.ValueString()
+	if id == "" {
+		id = identity.ID.ValueString()
+	}
+
+	networkID := data.NetworkID.ValueString()
+	if networkID == "" {
+		networkID = identity.NetworkID.ValueString()
+	}
+
 	site := data.Site.ValueString()
+	if site == "" {
+		site = identity.Site.ValueString()
+	}
 	if site == "" {
 		site = r.client.Site
 	}
 
-	peer, err := r.client.GetWireGuardPeer(
-		ctx,
-		site,
-		data.NetworkID.ValueString(),
-		data.ID.ValueString(),
-	)
+	if id == "" || networkID == "" {
+		resp.Diagnostics.AddError(
+			"Invalid State",
+			"WireGuard peer must have an ID and a network ID",
+		)
+		return
+	}
+
+	peer, err := r.client.GetWireGuardPeer(ctx, site, networkID, id)
 	if err != nil {
 		if _, ok := err.(*unifi.NotFoundError); ok {
 			resp.State.RemoveResource(ctx)
@@ -210,12 +387,21 @@ func (r *wireguardPeerResource) Read(
 		}
 		resp.Diagnostics.AddError(
 			"Error Reading WireGuard Peer",
-			"Could not read WireGuard peer with ID "+data.ID.ValueString()+": "+err.Error(),
+			"Could not read WireGuard peer with ID "+id+": "+err.Error(),
 		)
 		return
 	}
 
 	resp.Diagnostics.Append(r.peerToModel(ctx, peer, &data, site)...)
+
+	// A pre-existing identity is re-set unchanged; a fresh one is derived
+	// from the refreshed state.
+	if !haveIdentity {
+		identity.ID = data.ID
+		identity.NetworkID = data.NetworkID
+		identity.Site = data.Site
+	}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -227,6 +413,19 @@ func (r *wireguardPeerResource) Update(
 	var data wireguardPeerResourceModel
 
 	resp.Diagnostics.Append(req.Plan.Get(ctx, &data)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	updateTimeout, timeoutDiags := data.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
+	data.PresharedKeyWO = r.readPresharedKeyWO(ctx, req.Config, &resp.Diagnostics)
 	if resp.Diagnostics.HasError() {
 		return
 	}
@@ -253,6 +452,21 @@ func (r *wireguardPeerResource) Update(
 	}
 
 	resp.Diagnostics.Append(r.peerToModel(ctx, updatedPeer, &data, site)...)
+
+	// Identity is immutable once set: carry the incoming identity through
+	// unchanged, deriving a fresh one from state only when it was absent.
+	identity := wireguardPeerIdentityModel{
+		ID:        data.ID,
+		NetworkID: data.NetworkID,
+		Site:      data.Site,
+	}
+	if req.Identity != nil && !req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -267,6 +481,14 @@ func (r *wireguardPeerResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := data.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	site := data.Site.ValueString()
 	if site == "" {
@@ -292,25 +514,65 @@ func (r *wireguardPeerResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	// Import format: "site:network_id:id" or "network_id:id" for default site
-	idParts := strings.Split(req.ID, ":")
+	// Import by ID string (terraform import CLI, or import block with id set).
+	// Format: "site:network_id:id" or "network_id:id" for the default site.
+	if req.ID != "" {
+		idParts := strings.Split(req.ID, ":")
 
-	switch len(idParts) {
-	case 3:
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), idParts[0])...)
+		var identity wireguardPeerIdentityModel
+		switch len(idParts) {
+		case 3:
+			identity.Site = types.StringValue(idParts[0])
+			identity.NetworkID = types.StringValue(idParts[1])
+			identity.ID = types.StringValue(idParts[2])
+			resp.Diagnostics.Append(
+				resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+		case 2:
+			identity.NetworkID = types.StringValue(idParts[0])
+			identity.ID = types.StringValue(idParts[1])
+		default:
+			resp.Diagnostics.AddError(
+				"Invalid Import ID",
+				"Import ID must be in format 'site:network_id:id' or 'network_id:id'",
+			)
+			return
+		}
+
 		resp.Diagnostics.Append(
-			resp.State.SetAttribute(ctx, path.Root("network_id"), idParts[1])...)
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), idParts[2])...)
-	case 2:
-		resp.Diagnostics.Append(
-			resp.State.SetAttribute(ctx, path.Root("network_id"), idParts[0])...)
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), idParts[1])...)
-	default:
-		resp.Diagnostics.AddError(
-			"Invalid Import ID",
-			"Import ID must be in format 'site:network_id:id' or 'network_id:id'",
-		)
+			resp.State.SetAttribute(ctx, path.Root("network_id"), identity.NetworkID)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
+		return
 	}
+
+	// Import by resource identity (import block with identity, Terraform 1.12+).
+	var identity wireguardPeerIdentityModel
+	resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+	resp.Diagnostics.Append(
+		resp.State.SetAttribute(ctx, path.Root("network_id"), identity.NetworkID)...)
+	if !identity.Site.IsNull() && identity.Site.ValueString() != "" {
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+	}
+}
+
+// readPresharedKeyWO reads the write-only preshared_key_wo attribute. Write-only
+// values only ever appear in the request config, never in the plan or state, so
+// they have to be fetched explicitly and copied into the model before
+// conversion.
+func (r *wireguardPeerResource) readPresharedKeyWO(
+	ctx context.Context,
+	config tfsdk.Config,
+	diags *diag.Diagnostics,
+) types.String {
+	var keyWO types.String
+	diags.Append(config.GetAttribute(ctx, path.Root("preshared_key_wo"), &keyWO)...)
+	return keyWO
 }
 
 // modelToPeer converts the Terraform model to the API struct.
@@ -323,6 +585,16 @@ func (r *wireguardPeerResource) modelToPeer(
 		InterfaceIP: model.InterfaceIP.ValueString(),
 		PublicKey:   model.PublicKey.ValueString(),
 		AllowedIPs:  []string{},
+	}
+
+	// The peer endpoints are full replaces: a write that omits preshared_key
+	// destroys a stored one (verified on Network 10.6.106). go-unifi models it
+	// as *string with omitempty, so leaving it nil keeps the key off the wire
+	// and the controller preserves what it has (#490).
+	if !model.PresharedKey.IsNull() && !model.PresharedKey.IsUnknown() {
+		peer.PresharedKey = model.PresharedKey.ValueStringPointer()
+	} else if !model.PresharedKeyWO.IsNull() && !model.PresharedKeyWO.IsUnknown() {
+		peer.PresharedKey = model.PresharedKeyWO.ValueStringPointer()
 	}
 
 	var diags diag.Diagnostics
@@ -347,7 +619,143 @@ func (r *wireguardPeerResource) peerToModel(
 	model.InterfaceIP = types.StringValue(peer.InterfaceIP)
 	model.PublicKey = types.StringValue(peer.PublicKey)
 
+	// The controller returns the key in clear text and omits the field when the
+	// peer has none. Only mirror it into state when the state-bearing attribute
+	// is the one in use: with preshared_key_wo the secret must stay out of
+	// state, so the attribute is left as configured.
+	if model.PresharedKeyWO.IsNull() || model.PresharedKeyWO.IsUnknown() {
+		if peer.PresharedKey != nil && *peer.PresharedKey != "" {
+			model.PresharedKey = types.StringValue(*peer.PresharedKey)
+		} else {
+			model.PresharedKey = types.StringNull()
+		}
+	}
+
 	allowedIPs, diags := types.ListValueFrom(ctx, types.StringType, peer.AllowedIPs)
 	model.AllowedIPs = allowedIPs
 	return diags
+}
+
+// ListResourceConfigSchema implements [list.ListResource]. Peers belong to a
+// WireGuard server network, so `network_id` is required.
+func (r *wireguardPeerResource) ListResourceConfigSchema(
+	_ context.Context,
+	_ list.ListResourceSchemaRequest,
+	resp *list.ListResourceSchemaResponse,
+) {
+	resp.Schema = listschema.Schema{
+		MarkdownDescription: "List WireGuard peers of a WireGuard server network.",
+		Attributes: map[string]listschema.Attribute{
+			"site": listschema.StringAttribute{
+				MarkdownDescription: "The name of the site the WireGuard server belongs to.",
+				Optional:            true,
+			},
+			"network_id": listschema.StringAttribute{
+				MarkdownDescription: "The ID of the WireGuard server network to list peers from.",
+				Required:            true,
+			},
+		},
+		Blocks: map[string]listschema.Block{
+			"filter": listschema.ListNestedBlock{
+				NestedObject: listschema.NestedBlockObject{
+					Attributes: map[string]listschema.Attribute{
+						"name": listschema.StringAttribute{
+							MarkdownDescription: "The name of the filter to apply. Supported values are: `name`.",
+							Required:            true,
+						},
+						"value": listschema.StringAttribute{
+							MarkdownDescription: "The value to filter by.",
+							Required:            true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// List implements [list.ListResource].
+func (r *wireguardPeerResource) List(
+	ctx context.Context,
+	req list.ListRequest,
+	stream *list.ListResultsStream,
+) {
+	var config wireguardPeerListConfigModel
+
+	diags := req.Config.Get(ctx, &config)
+	if diags.HasError() {
+		stream.Results = list.ListResultsStreamDiagnostics(diags)
+		return
+	}
+
+	site := config.Site.ValueString()
+	if site == "" {
+		site = r.client.Site
+	}
+
+	// Process filter blocks.
+	var filters []wireguardPeerListFilterModel
+	if !config.Filter.IsNull() && !config.Filter.IsUnknown() {
+		config.Filter.ElementsAs(ctx, &filters, false)
+	}
+
+	postFilters := make(map[string]string)
+	for _, f := range filters {
+		postFilters[f.Name.ValueString()] = f.Value.ValueString()
+	}
+
+	// Peers belong to a VPN-server network; network_id is required.
+	peers, err := r.client.ListWireGuardPeers(ctx, site, config.NetworkID.ValueString())
+	if err != nil {
+		var d diag.Diagnostics
+		d.AddError(
+			"Error Listing WireGuard Peers",
+			"Could not list WireGuard peers: "+err.Error(),
+		)
+		stream.Results = list.ListResultsStreamDiagnostics(d)
+		return
+	}
+
+	stream.Results = func(push func(list.ListResult) bool) {
+		for i := range peers {
+			peer := peers[i]
+
+			// Apply name filter.
+			if val, ok := postFilters["name"]; ok {
+				if peer.Name != val {
+					continue
+				}
+			}
+
+			result := req.NewListResult(ctx)
+
+			// Display name: prefer name, fall back to ID.
+			if peer.Name != "" {
+				result.DisplayName = peer.Name
+			} else {
+				result.DisplayName = peer.ID
+			}
+
+			// Set identity.
+			result.Diagnostics.Append(
+				result.Identity.Set(ctx, wireguardPeerIdentityModel{
+					ID:        types.StringValue(peer.ID),
+					NetworkID: types.StringValue(peer.NetworkID),
+					Site:      types.StringValue(site),
+				})...,
+			)
+
+			// Convert to model.
+			var model wireguardPeerResourceModel
+			result.Diagnostics.Append(r.peerToModel(ctx, &peer, &model, site)...)
+			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
+				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
+			}
+
+			if !push(result) {
+				return
+			}
+		}
+	}
 }

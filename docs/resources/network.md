@@ -36,19 +36,25 @@ resource "unifi_network" "dual_stack" {
     stop    = "10.0.1.254"
   }
 
-  ipv6_interface_type        = "static"
-  ipv6_static_subnet         = "fd00:1::1/64"
-  ipv6_ra                    = true
-  ipv6_ra_priority           = "high"
-  ipv6_ra_valid_lifetime     = 86400
-  ipv6_ra_preferred_lifetime = 14400
+  ipv6 = {
+    interface_type = "static"
+    static_subnet  = "fd00:1::1/64"
+    ra = {
+      enabled            = true
+      priority           = "high"
+      valid_lifetime     = "24h"
+      preferred_lifetime = "4h"
+    }
+  }
 
   dhcp_v6_server = {
-    enabled  = true
-    dns_auto = true
-    start    = "::2"
-    stop     = "::7d1"
-    lease    = 86400
+    enabled = true
+    dns = {
+      auto = true
+    }
+    start = "::2"
+    stop  = "::7d1"
+    lease = 86400
   }
 }
 
@@ -58,15 +64,21 @@ resource "unifi_network" "ipv6_pd" {
   subnet = "10.0.2.1/24"
   vlan   = 12
 
-  ipv6_interface_type           = "pd"
-  ipv6_pd_interface             = "wan"
-  ipv6_pd_prefixid              = "1"
-  ipv6_pd_auto_prefixid_enabled = false
-  # ipv6_pd_start/stop are required for a prefix-delegation network — the
-  # controller rejects it with api.err.InvalidIpv6Addr otherwise.
-  ipv6_pd_start = "::2"
-  ipv6_pd_stop  = "::7d1"
-  ipv6_ra       = true
+  ipv6 = {
+    interface_type = "pd"
+    pd = {
+      interface             = "wan"
+      prefixid              = "1"
+      auto_prefixid_enabled = false
+      # start/stop are required for a prefix-delegation network — the
+      # controller rejects it with api.err.InvalidIpv6Addr otherwise.
+      start = "::2"
+      stop  = "::7d1"
+    }
+    ra = {
+      enabled = true
+    }
+  }
 }
 
 # Third-party gateway (VLAN-only) network
@@ -92,37 +104,29 @@ resource "unifi_network" "third_party" {
 
 ### Optional
 
-- `auto_scale` (Boolean) Specifies whether auto-scaling is enabled.
+- `auto_scale` (Boolean) Specifies whether auto-scaling is enabled. The controller stores no default: left unset, the attribute is not written and whatever the controller holds is preserved.
 - `dhcp_guarding` (Attributes) DHCP guarding configuration. Specifies allowed DHCP server IPs to prevent rogue DHCP servers on the network. (see [below for nested schema](#nestedatt--dhcp_guarding))
 - `dhcp_relay` (Attributes) DHCP relay configuration. (see [below for nested schema](#nestedatt--dhcp_relay))
 - `dhcp_server` (Attributes) DHCP server configuration. (see [below for nested schema](#nestedatt--dhcp_server))
 - `dhcp_v6_server` (Attributes) DHCPv6 server configuration. (see [below for nested schema](#nestedatt--dhcp_v6_server))
 - `domain_name` (String) The domain name for the network.
 - `enabled` (Boolean) Specifies whether the network is enabled.
+- `firewall_zone_id` (String) The firewall zone ID assigned to this network. Note: This field is dual-managed and can compete with `unifi_firewall_zone.network_ids`. To prevent state drift loops, ensure you manage zone membership from exactly one side. On Zone-Based Firewall (ZBF) controllers, this field is tightly coupled to the network's `purpose` field.
 - `gateway_type` (String) The gateway type. Must be one of `default` or `switch`.
 - `igmp_snooping` (Boolean) Specifies whether IGMP snooping is enabled.
 - `internet_access` (Boolean) Specifies whether internet access is enabled.
-- `ip_aliases` (List of String) List of IP aliases for the network.
-- `ipv6_aliases` (List of String) List of IPv6 aliases for the network.
-- `ipv6_interface_type` (String) Specifies which type of IPv6 connection to use. Must be one of `none`, `pd`, or `static`.
-- `ipv6_pd_auto_prefixid_enabled` (Boolean) Specifies whether automatic prefix ID assignment is enabled for IPv6 Prefix Delegation.
-- `ipv6_pd_interface` (String) The IPv6 Prefix Delegation WAN interface (e.g., `wan`, `wan2`).
-- `ipv6_pd_prefixid` (String) The IPv6 Prefix Delegation prefix ID (hex string, e.g., `0`, `1a`).
-- `ipv6_pd_start` (String) The start of the IPv6 Prefix Delegation range (e.g. `::2`). Required together with `ipv6_pd_stop` when `ipv6_interface_type` is `pd`, otherwise the controller rejects the network with `api.err.InvalidIpv6Addr`.
-- `ipv6_pd_stop` (String) The end of the IPv6 Prefix Delegation range (e.g. `::7d1`). Required together with `ipv6_pd_start` when `ipv6_interface_type` is `pd`.
-- `ipv6_ra` (Boolean) Specifies whether IPv6 Router Advertisement (RA) is enabled.
-- `ipv6_ra_preferred_lifetime` (Number) The IPv6 Router Advertisement preferred lifetime in seconds (0-31536000).
-- `ipv6_ra_priority` (String) The IPv6 Router Advertisement priority. Must be one of `high`, `medium`, or `low`.
-- `ipv6_ra_valid_lifetime` (Number) The IPv6 Router Advertisement valid lifetime in seconds (0-31536000).
-- `ipv6_static_subnet` (String) The IPv6 static subnet of the network. Only used when `ipv6_interface_type` is `static`.
-- `lte_lan` (Boolean) Whether this network/VLAN stays active when the gateway fails over to a UniFi LTE (cellular) backup WAN. Maps to the controller's `lte_lan_enabled` flag and only matters when a UniFi LTE failover device is in use; otherwise it is cosmetic. Defaults to `true` (network stays available during LTE failover); set to `false` to disable it while on the LTE backup link. The controller may set this automatically, which is why existing networks can show differing values.
+- `ip_aliases` (List of String) List of IP aliases for the network, in CIDR notation (e.g. `192.168.2.1/24`). The controller rejects entries without a prefix length.
+- `ipv6` (Attributes) IPv6 settings for the network. When omitted, `interface_type` is taken from the controller and the remaining values are read from the controller. (see [below for nested schema](#nestedatt--ipv6))
+- `lte_lan` (Boolean) Whether this network/VLAN stays active when the gateway fails over to a UniFi LTE (cellular) backup WAN. Maps to the controller's `lte_lan_enabled` flag and only matters when a UniFi LTE failover device is in use; otherwise it is cosmetic. The controller stores no default: left unset, the attribute is not written and whatever the controller holds is preserved, which is why existing networks show differing values.
 - `multicast_dns` (Boolean) Specifies whether mDNS is enabled. This is read back from the controller rather than defaulted: some controllers (notably UniFi OS gateways) ignore `mdns_enabled` at create/update time and always store `false`, so forcing a `true` default produced a "provider produced inconsistent result after apply" error.
 - `nat_outbound_ip_addresses` (Attributes List) List of NAT outbound IP addresses. (see [below for nested schema](#nestedatt--nat_outbound_ip_addresses))
 - `network_isolation` (Boolean) Specifies whether network isolation is enabled.
-- `setting_preference` (String) Setting preference. Must be one of `auto` or `manual`.
+- `purpose` (String) The network purpose: `corporate` (default), `guest`, or `vlan-only`. Leave unset to let the controller manage it (a `third_party_gateway` network is always `vlan-only`). **Note:** on Zone-Based-Firewall controllers the purpose is coupled to the firewall zone — a `guest` network only keeps `purpose = "guest"` while it belongs to the guest/Hotspot zone (assign it there via `unifi_firewall_zone`), otherwise the controller rewrites it back to `corporate` and the apply fails with an inconsistent-result error.
+- `setting_preference` (String) Setting preference. Must be one of `auto` or `manual`. Taken from the controller when not set; an adopted network keeps its own preference, so importing a `manual` network no longer proposes `auto` - which would also reset DHCP guarding (#544).
 - `site` (String) The name of the site to associate the network with.
-- `subnet` (String) The IPv4 subnet of the network in CIDR notation. Optional: it is not required for `vlan_only` networks (`third_party_gateway = true`), where the UniFi controller does not manage the subnet.
+- `subnet` (String) The network's gateway IP and prefix in CIDR notation. The host portion is the gateway address the controller assigns — it need not be the first usable address: `10.0.10.1/24` uses gateway `10.0.10.1`, while `10.0.10.254/24` uses gateway `10.0.10.254` on the same subnet. Optional: it is not required for `vlan_only` networks (`third_party_gateway = true`), where the UniFi controller does not manage the subnet.
 - `third_party_gateway` (Boolean) Specifies whether this network uses a third-party gateway. When enabled, the network purpose is set to `vlan-only` and only VLAN ID, DHCP guarding, and basic network settings are configured.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 - `vlan` (Number) The VLAN ID for the network.
 
 ### Read-Only
@@ -135,7 +139,7 @@ resource "unifi_network" "third_party" {
 Optional:
 
 - `enabled` (Boolean) Specifies whether DHCP guarding is enabled.
-- `servers` (List of String) List of allowed DHCP server IP addresses (maximum 3).
+- `servers` (List of String) List of allowed DHCP server IP addresses (maximum 3). On `corporate` and `guest` networks the controller only honors DHCP guarding with `setting_preference = "manual"`; when `setting_preference` is not configured, the provider sets it to `manual` automatically whenever `dhcp_guarding.enabled` is `true`.
 
 
 <a id="nestedatt--dhcp_relay"></a>
@@ -154,12 +158,11 @@ Optional:
 
 - `boot` (Attributes) DHCP boot settings. (see [below for nested schema](#nestedatt--dhcp_server--boot))
 - `conflict_checking` (Boolean) Specifies whether DHCP conflict checking is enabled.
-- `dns_enabled` (Boolean) Specifies whether DHCP DNS is enabled.
-- `dns_servers` (List of String) List of DNS server addresses for DHCP clients.
+- `dns` (Attributes) DNS servers handed out to DHCP clients. (see [below for nested schema](#nestedatt--dhcp_server--dns))
 - `enabled` (Boolean) Specifies whether DHCP server is enabled.
 - `gateway_enabled` (Boolean) Specifies whether DHCP gateway is enabled.
-- `leasetime` (Number) Specifies the lease time for DHCP addresses in seconds.
-- `ntp_enabled` (Boolean) Specifies whether DHCP NTP is enabled.
+- `leasetime` (String) Specifies the DHCP lease time, as a Go duration string (e.g. `24h`, `86400s`). Defaults to `24h0m0s`.
+- `ntp` (Attributes) NTP servers handed out to DHCP clients. (see [below for nested schema](#nestedatt--dhcp_server--ntp))
 - `start` (String) The IPv4 address where the DHCP range starts.
 - `stop` (String) The IPv4 address where the DHCP range stops.
 - `tftp_server` (String) TFTP server address.
@@ -178,6 +181,24 @@ Optional:
 - `server` (String) TFTP server for boot options.
 
 
+<a id="nestedatt--dhcp_server--dns"></a>
+### Nested Schema for `dhcp_server.dns`
+
+Optional:
+
+- `enabled` (Boolean) Specifies whether DHCP DNS is enabled.
+- `servers` (List of String) List of DNS server addresses for DHCP clients.
+
+
+<a id="nestedatt--dhcp_server--ntp"></a>
+### Nested Schema for `dhcp_server.ntp`
+
+Optional:
+
+- `enabled` (Boolean) Specifies whether DHCP NTP is enabled.
+- `servers` (List of String) List of NTP server addresses for DHCP clients.
+
+
 <a id="nestedatt--dhcp_server--wins"></a>
 ### Nested Schema for `dhcp_server.wins`
 
@@ -193,12 +214,56 @@ Optional:
 
 Optional:
 
-- `dns_auto` (Boolean) Specifies whether DNS auto-discovery is enabled for DHCPv6.
-- `dns_servers` (List of String) List of DNS server addresses for DHCPv6 clients (maximum 4).
+- `dns` (Attributes) DNS servers handed out to DHCPv6 clients. (see [below for nested schema](#nestedatt--dhcp_v6_server--dns))
 - `enabled` (Boolean) Specifies whether the DHCPv6 server is enabled.
 - `lease` (Number) The lease time for DHCPv6 addresses in seconds.
 - `start` (String) The start of the DHCPv6 address range.
 - `stop` (String) The end of the DHCPv6 address range.
+
+<a id="nestedatt--dhcp_v6_server--dns"></a>
+### Nested Schema for `dhcp_v6_server.dns`
+
+Optional:
+
+- `auto` (Boolean) Specifies whether DNS auto-discovery is enabled for DHCPv6.
+- `servers` (List of String) List of DNS server addresses for DHCPv6 clients (maximum 4).
+
+
+
+<a id="nestedatt--ipv6"></a>
+### Nested Schema for `ipv6`
+
+Optional:
+
+- `aliases` (List of String) List of IPv6 aliases for the network. Not currently supported: the underlying UniFi API client has no field for this value, so a non-empty list is rejected at plan time (#413).
+- `client_address_assignment` (String) How clients on this network obtain an IPv6 address (UI: Networks → IPv6 → Client Address Assignment). One of `slaac` (SLAAC only), `dhcpv6` (DHCPv6 only), or `slaac-dhcpv6` (both). Computed from the controller when not set.
+- `interface_type` (String) Specifies which type of IPv6 connection to use. Must be one of `none`, `pd`, or `static`. Taken from the controller when not set; an adopted network keeps the type it already has (#544).
+- `pd` (Attributes) IPv6 Prefix Delegation (PD) settings, used when `interface_type` is `pd`. (see [below for nested schema](#nestedatt--ipv6--pd))
+- `ra` (Attributes) IPv6 Router Advertisement (RA) settings. (see [below for nested schema](#nestedatt--ipv6--ra))
+- `static_subnet` (String) The IPv6 static subnet of the network. Only used when `interface_type` is `static`.
+
+<a id="nestedatt--ipv6--pd"></a>
+### Nested Schema for `ipv6.pd`
+
+Optional:
+
+- `auto_prefixid_enabled` (Boolean) Specifies whether automatic prefix ID assignment is enabled for IPv6 Prefix Delegation.
+- `interface` (String) The IPv6 Prefix Delegation WAN interface (e.g., `wan`, `wan2`).
+- `prefixid` (String) The IPv6 Prefix Delegation prefix ID (hex string, e.g., `0`, `1a`).
+- `start` (String) The start of the IPv6 Prefix Delegation range (e.g. `::2`). Required together with `stop` when `ipv6.interface_type` is `pd`, otherwise the controller rejects the network with `api.err.InvalidIpv6Addr`.
+- `stop` (String) The end of the IPv6 Prefix Delegation range (e.g. `::7d1`). Required together with `start` when `ipv6.interface_type` is `pd`.
+
+
+<a id="nestedatt--ipv6--ra"></a>
+### Nested Schema for `ipv6.ra`
+
+Optional:
+
+- `enabled` (Boolean) Specifies whether IPv6 Router Advertisement (RA) is enabled.
+- `preferred_lifetime` (String) The IPv6 Router Advertisement preferred lifetime, as a Go duration string (e.g. `14400s`, `4h`). Must be a whole number of seconds between `0s` and `31536000s` (1 year).
+- `priority` (String) The IPv6 Router Advertisement priority. Must be one of `high`, `medium`, or `low`.
+- `valid_lifetime` (String) The IPv6 Router Advertisement valid lifetime, as a Go duration string (e.g. `86400s`, `24h`). Must be a whole number of seconds between `0s` and `31536000s` (1 year).
+
 
 
 <a id="nestedatt--nat_outbound_ip_addresses"></a>
@@ -211,11 +276,22 @@ Optional:
 - `mode` (String) The mode.
 - `wan_network_group` (String) The WAN network group.
 
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+
 ## Import
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # import by ID from provider configured site

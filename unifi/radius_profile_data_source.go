@@ -3,11 +3,15 @@ package unifi
 import (
 	"context"
 	"fmt"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/datasource/timeouts"
+	"github.com/hashicorp/terraform-plugin-framework-timetypes/timetypes"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 )
 
 var _ datasource.DataSource = &radiusProfileDataSource{}
@@ -20,17 +24,20 @@ type radiusProfileDataSource struct {
 	client *Client
 }
 
+// radiusProfileDataSourceModel describes the data source data model. The
+// `interim_update` and `vlan` objects share their sub-models and attribute
+// types with the resource (see radius_profile_resource.go).
 type radiusProfileDataSourceModel struct {
-	ID                    types.String `tfsdk:"id"`
-	Site                  types.String `tfsdk:"site"`
-	Name                  types.String `tfsdk:"name"`
-	AccountingEnabled     types.Bool   `tfsdk:"accounting_enabled"`
-	InterimUpdateEnabled  types.Bool   `tfsdk:"interim_update_enabled"`
-	InterimUpdateInterval types.Int64  `tfsdk:"interim_update_interval"`
-	UseUSGAcctServer      types.Bool   `tfsdk:"use_usg_acct_server"`
-	UseUSGAuthServer      types.Bool   `tfsdk:"use_usg_auth_server"`
-	VlanEnabled           types.Bool   `tfsdk:"vlan_enabled"`
-	VlanWlanMode          types.String `tfsdk:"vlan_wlan_mode"`
+	ID                types.String `tfsdk:"id"`
+	Site              types.String `tfsdk:"site"`
+	Name              types.String `tfsdk:"name"`
+	AccountingEnabled types.Bool   `tfsdk:"accounting_enabled"`
+	InterimUpdate     types.Object `tfsdk:"interim_update"`
+	UseUSGAcctServer  types.Bool   `tfsdk:"use_usg_acct_server"`
+	UseUSGAuthServer  types.Bool   `tfsdk:"use_usg_auth_server"`
+	Vlan              types.Object `tfsdk:"vlan"`
+
+	Timeouts timeouts.Value `tfsdk:"timeouts"`
 }
 
 func (d *radiusProfileDataSource) Metadata(
@@ -67,13 +74,20 @@ func (d *radiusProfileDataSource) Schema(
 				MarkdownDescription: "Whether RADIUS accounting is enabled.",
 				Computed:            true,
 			},
-			"interim_update_enabled": schema.BoolAttribute{
-				MarkdownDescription: "Whether interim updates are enabled.",
+			"interim_update": schema.SingleNestedAttribute{
+				MarkdownDescription: "RADIUS interim accounting update settings.",
 				Computed:            true,
-			},
-			"interim_update_interval": schema.Int64Attribute{
-				MarkdownDescription: "The interim update interval.",
-				Computed:            true,
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether interim updates are enabled.",
+						Computed:            true,
+					},
+					"interval": schema.StringAttribute{
+						MarkdownDescription: "The interim update interval, as a Go duration string.",
+						CustomType:          timetypes.GoDurationType{},
+						Computed:            true,
+					},
+				},
 			},
 			"use_usg_acct_server": schema.BoolAttribute{
 				MarkdownDescription: "Whether to use USG as accounting server.",
@@ -83,14 +97,21 @@ func (d *radiusProfileDataSource) Schema(
 				MarkdownDescription: "Whether to use USG as authentication server.",
 				Computed:            true,
 			},
-			"vlan_enabled": schema.BoolAttribute{
-				MarkdownDescription: "Whether VLAN is enabled.",
+			"vlan": schema.SingleNestedAttribute{
+				MarkdownDescription: "Dynamic VLAN assignment settings.",
 				Computed:            true,
+				Attributes: map[string]schema.Attribute{
+					"enabled": schema.BoolAttribute{
+						MarkdownDescription: "Whether VLAN is enabled.",
+						Computed:            true,
+					},
+					"wlan_mode": schema.StringAttribute{
+						MarkdownDescription: "The VLAN WLAN mode.",
+						Computed:            true,
+					},
+				},
 			},
-			"vlan_wlan_mode": schema.StringAttribute{
-				MarkdownDescription: "The VLAN WLAN mode.",
-				Computed:            true,
-			},
+			"timeouts": timeouts.Attributes(ctx),
 		},
 	}
 }
@@ -131,6 +152,14 @@ func (d *radiusProfileDataSource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
 	site := data.Site.ValueString()
 	if site == "" {
 		site = d.client.Site
@@ -168,12 +197,30 @@ func (d *radiusProfileDataSource) Read(
 	data.Site = types.StringValue(site)
 	data.Name = types.StringValue(radiusProfile.Name)
 	data.AccountingEnabled = types.BoolValue(radiusProfile.AccountingEnabled)
-	data.InterimUpdateEnabled = types.BoolValue(radiusProfile.InterimUpdateEnabled)
-	data.InterimUpdateInterval = types.Int64PointerValue(radiusProfile.InterimUpdateInterval)
 	data.UseUSGAcctServer = types.BoolValue(radiusProfile.UseUsgAcctServer)
 	data.UseUSGAuthServer = types.BoolValue(radiusProfile.UseUsgAuthServer)
-	data.VlanEnabled = types.BoolValue(radiusProfile.VLANEnabled)
-	data.VlanWlanMode = types.StringValue(radiusProfile.VLANWLANMode)
+
+	interimUpdate, diags := types.ObjectValueFrom(
+		ctx,
+		radiusProfileInterimUpdateAttrTypes(),
+		radiusProfileInterimUpdateModel{
+			Enabled:  types.BoolValue(radiusProfile.InterimUpdateEnabled),
+			Interval: util.DurationPtrValue(radiusProfile.InterimUpdateInterval, time.Second),
+		},
+	)
+	resp.Diagnostics.Append(diags...)
+	data.InterimUpdate = interimUpdate
+
+	vlan, diags := types.ObjectValueFrom(ctx, radiusProfileVlanAttrTypes(), radiusProfileVlanModel{
+		Enabled:  types.BoolValue(radiusProfile.VLANEnabled),
+		WlanMode: types.StringValue(radiusProfile.VLANWLANMode),
+	})
+	resp.Diagnostics.Append(diags...)
+	data.Vlan = vlan
+
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }

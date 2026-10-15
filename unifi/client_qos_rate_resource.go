@@ -4,27 +4,47 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
 	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
+	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/int64default"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 )
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                = &clientQosRateResource{}
-	_ resource.ResourceWithImportState = &clientQosRateResource{}
+	_ resource.Resource                 = &clientQosRateResource{}
+	_ resource.ResourceWithImportState  = &clientQosRateResource{}
+	_ resource.ResourceWithIdentity     = &clientQosRateResource{}
+	_ resource.ResourceWithUpgradeState = &clientQosRateResource{}
+)
+
+// Ensure provider defined types fully satisfy list interfaces.
+var (
+	_ list.ListResource              = &clientQosRateResource{}
+	_ list.ListResourceWithConfigure = &clientQosRateResource{}
 )
 
 func NewClientQosRateResource() resource.Resource {
+	return &clientQosRateResource{}
+}
+
+func NewClientQosRateListResource() list.ListResource {
 	return &clientQosRateResource{}
 }
 
@@ -35,11 +55,55 @@ type clientQosRateResource struct {
 
 // clientQosRateResourceModel describes the resource data model.
 type clientQosRateResourceModel struct {
-	ID             types.String `tfsdk:"id"`
-	Site           types.String `tfsdk:"site"`
-	Name           types.String `tfsdk:"name"`
-	QOSRateMaxDown types.Int64  `tfsdk:"qos_rate_max_down"`
-	QOSRateMaxUp   types.Int64  `tfsdk:"qos_rate_max_up"`
+	ID       types.String   `tfsdk:"id"`
+	Site     types.String   `tfsdk:"site"`
+	Name     types.String   `tfsdk:"name"`
+	QOSRate  types.Object   `tfsdk:"qos_rate"`
+	Timeouts timeouts.Value `tfsdk:"timeouts"`
+}
+
+// clientQosRateRateModel is the `qos_rate` nested object, shared by the
+// resource and the data source. It mirrors the max_up/max_down leaves of the
+// unifi_client `qos_rate` object.
+type clientQosRateRateModel struct {
+	MaxDown types.Int64 `tfsdk:"max_down"`
+	MaxUp   types.Int64 `tfsdk:"max_up"`
+}
+
+func clientQosRateRateAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"max_down": types.Int64Type,
+		"max_up":   types.Int64Type,
+	}
+}
+
+// clientQosRateRateDefault reproduces the values the flat qos_rate_max_down
+// and qos_rate_max_up attributes defaulted to when the practitioner left them
+// out of configuration, so the request body on create is unchanged when the
+// whole `qos_rate` block is omitted.
+func clientQosRateRateDefault() types.Object {
+	return types.ObjectValueMust(clientQosRateRateAttrTypes(), map[string]attr.Value{
+		"max_down": types.Int64Value(-1),
+		"max_up":   types.Int64Value(-1),
+	})
+}
+
+// clientQosRateIdentityModel describes the resource identity data model.
+type clientQosRateIdentityModel struct {
+	ID   types.String `tfsdk:"id"`
+	Site types.String `tfsdk:"site"`
+}
+
+// clientQosRateListConfigModel describes the list configuration model.
+type clientQosRateListConfigModel struct {
+	Site   types.String `tfsdk:"site"`
+	Filter types.List   `tfsdk:"filter"`
+}
+
+// clientQosRateListFilterModel represents a single name/value filter entry.
+type clientQosRateListFilterModel struct {
+	Name  types.String `tfsdk:"name"`
+	Value types.String `tfsdk:"value"`
 }
 
 func (r *clientQosRateResource) Metadata(
@@ -50,6 +114,33 @@ func (r *clientQosRateResource) Metadata(
 	resp.TypeName = req.ProviderTypeName + "_client_qos_rate"
 }
 
+// IdentitySchema implements [resource.ResourceWithIdentity].
+func (r *clientQosRateResource) IdentitySchema(
+	_ context.Context,
+	_ resource.IdentitySchemaRequest,
+	resp *resource.IdentitySchemaResponse,
+) {
+	resp.IdentitySchema = identityschema.Schema{
+		Version: 1,
+		Attributes: map[string]identityschema.Attribute{
+			"id": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+			"site": identityschema.StringAttribute{
+				OptionalForImport: true,
+			},
+		},
+	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity]. See
+// siteIdentityUpgraders.
+func (r *clientQosRateResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return siteIdentityUpgraders(func() *Client { return r.client })
+}
+
 func (r *clientQosRateResource) Schema(
 	ctx context.Context,
 	req resource.SchemaRequest,
@@ -57,6 +148,7 @@ func (r *clientQosRateResource) Schema(
 ) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: `Manages a client QOS rate, which can be used to limit bandwidth for groups of clients.`,
+		Version:             1,
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -79,26 +171,91 @@ func (r *clientQosRateResource) Schema(
 				MarkdownDescription: "The name of the client QOS rate.",
 				Required:            true,
 			},
-			"qos_rate_max_down": schema.Int64Attribute{
-				MarkdownDescription: "The QOS maximum download rate.",
+			"qos_rate": schema.SingleNestedAttribute{
+				MarkdownDescription: "QoS rate limits applied to clients in this group, in kbps.",
 				Optional:            true,
 				Computed:            true,
-				Default:             int64default.StaticInt64(-1),
-				Validators: []validator.Int64{
-					int64validator.Between(2, 100000),
+				Default:             objectdefault.StaticValue(clientQosRateRateDefault()),
+				Attributes: map[string]schema.Attribute{
+					"max_down": schema.Int64Attribute{
+						MarkdownDescription: "The QOS maximum download rate.",
+						Optional:            true,
+						Computed:            true,
+						Default:             int64default.StaticInt64(-1),
+						Validators: []validator.Int64{
+							int64validator.Any(
+								int64validator.OneOf(-1),
+								int64validator.Between(2, 100000),
+							),
+						},
+					},
+					"max_up": schema.Int64Attribute{
+						MarkdownDescription: "The QOS maximum upload rate.",
+						Optional:            true,
+						Computed:            true,
+						Default:             int64default.StaticInt64(-1),
+						Validators: []validator.Int64{
+							int64validator.Between(2, 100000),
+						},
+					},
 				},
 			},
-			"qos_rate_max_up": schema.Int64Attribute{
-				MarkdownDescription: "The QOS maximum upload rate.",
-				Optional:            true,
-				Computed:            true,
-				Default:             int64default.StaticInt64(-1),
-				Validators: []validator.Int64{
-					int64validator.Between(2, 100000),
-				},
+			"timeouts": timeouts.Attributes(
+				ctx,
+				timeouts.Opts{Create: true, Read: true, Update: true, Delete: true},
+			),
+		},
+	}
+}
+
+// UpgradeState migrates prior client QOS rate state to the current schema
+// version.
+//
+//	v0 -> current: the flat qos_rate_max_down and qos_rate_max_up attributes
+//	    moved into the nested `qos_rate` object. See nestClientQosRateState.
+func (r *clientQosRateResource) UpgradeState(
+	ctx context.Context,
+) map[int64]resource.StateUpgrader {
+	var schemaResp resource.SchemaResponse
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	return map[int64]resource.StateUpgrader{
+		0: {
+			StateUpgrader: func(
+				ctx context.Context,
+				req resource.UpgradeStateRequest,
+				resp *resource.UpgradeStateResponse,
+			) {
+				if req.RawState == nil {
+					return
+				}
+				dv, err := util.UpgradeRawState(
+					schemaType,
+					req.RawState.JSON,
+					nestClientQosRateState,
+				)
+				if err != nil {
+					resp.Diagnostics.AddError(
+						"Failed to upgrade client QOS rate state",
+						err.Error(),
+					)
+					return
+				}
+				resp.DynamicValue = dv
 			},
 		},
 	}
+}
+
+// nestClientQosRateState rewrites flat v0 client QOS rate state into the
+// nested-object layout introduced in schema v1. Keys that are absent are
+// skipped.
+func nestClientQosRateState(state map[string]any) {
+	util.NestFields(state, "qos_rate", map[string]string{
+		"qos_rate_max_down": "max_down",
+		"qos_rate_max_up":   "max_up",
+	})
 }
 
 func (r *clientQosRateResource) Configure(
@@ -138,6 +295,14 @@ func (r *clientQosRateResource) Create(
 		return
 	}
 
+	createTimeout, timeoutDiags := plan.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
 	site := plan.Site.ValueString()
 	if site == "" {
 		site = r.client.Site
@@ -167,6 +332,10 @@ func (r *clientQosRateResource) Create(
 		return
 	}
 
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, clientQosRateIdentityModel{
+		ID:   plan.ID,
+		Site: plan.Site,
+	})...)
 	diags = resp.State.Set(ctx, plan)
 	resp.Diagnostics.Append(diags...)
 }
@@ -182,6 +351,31 @@ func (r *clientQosRateResource) Read(
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
 		return
+	}
+
+	readTimeout, timeoutDiags := state.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Fall back to the resource identity when the state carries no ID (e.g.
+	// old states, or a state written by an identity-based import).
+	if state.ID.IsNull() || state.ID.IsUnknown() {
+		if req.Identity != nil && !req.Identity.Raw.IsNull() {
+			var identity clientQosRateIdentityModel
+			resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+			if resp.Diagnostics.HasError() {
+				return
+			}
+			state.ID = identity.ID
+			if (state.Site.IsNull() || state.Site.IsUnknown()) &&
+				identity.Site.ValueString() != "" {
+				state.Site = identity.Site
+			}
+		}
 	}
 
 	site := state.Site.ValueString()
@@ -212,6 +406,15 @@ func (r *clientQosRateResource) Read(
 		return
 	}
 
+	// A stored identity must be passed through unchanged: Terraform treats
+	// any modification of a non-null identity (including filling a null
+	// attribute) as an error. Only derive identity from state when none exists.
+	if req.Identity == nil || req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, clientQosRateIdentityModel{
+			ID:   state.ID,
+			Site: state.Site,
+		})...)
+	}
 	diags = resp.State.Set(ctx, state)
 	resp.Diagnostics.Append(diags...)
 }
@@ -235,6 +438,14 @@ func (r *clientQosRateResource) Update(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	updateTimeout, timeoutDiags := plan.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
 
 	// Step 2: Apply the plan changes to the state object
 	r.applyPlanToState(ctx, &plan, &state)
@@ -272,12 +483,23 @@ func (r *clientQosRateResource) Update(
 		return
 	}
 
+	state.Timeouts = plan.Timeouts
+
+	// A stored identity must be passed through unchanged: Terraform treats
+	// any modification of a non-null identity (including filling a null
+	// attribute) as an error. Only derive identity from state when none exists.
+	if req.Identity == nil || req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, clientQosRateIdentityModel{
+			ID:   state.ID,
+			Site: state.Site,
+		})...)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
 // applyPlanToState merges plan values into state, preserving state values where plan is null/unknown.
 func (r *clientQosRateResource) applyPlanToState(
-	_ context.Context,
+	ctx context.Context,
 	plan *clientQosRateResourceModel,
 	state *clientQosRateResourceModel,
 ) {
@@ -285,12 +507,9 @@ func (r *clientQosRateResource) applyPlanToState(
 	if !plan.Name.IsNull() && !plan.Name.IsUnknown() {
 		state.Name = plan.Name
 	}
-	if !plan.QOSRateMaxDown.IsNull() && !plan.QOSRateMaxDown.IsUnknown() {
-		state.QOSRateMaxDown = plan.QOSRateMaxDown
-	}
-	if !plan.QOSRateMaxUp.IsNull() && !plan.QOSRateMaxUp.IsUnknown() {
-		state.QOSRateMaxUp = plan.QOSRateMaxUp
-	}
+	// Each known qos_rate leaf in the plan replaces its state counterpart; a
+	// null/unknown leaf (or the whole object) keeps the state value.
+	state.QOSRate = util.OverlayKnownObject(ctx, plan.QOSRate, state.QOSRate)
 }
 
 func (r *clientQosRateResource) Delete(
@@ -305,6 +524,14 @@ func (r *clientQosRateResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := state.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	site := state.Site.ValueString()
 	if site == "" {
@@ -331,19 +558,39 @@ func (r *clientQosRateResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	idParts := strings.Split(req.ID, ":")
-	if len(idParts) == 2 {
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), idParts[0])...)
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), idParts[1])...)
-	} else {
-		resource.ImportStatePassthroughID(ctx, path.Root("id"), req, resp)
+	// Import by ID string (terraform import CLI, or an import block with id
+	// set): either a bare controller ID or the documented "site:id" form.
+	if req.ID != "" {
+		id := req.ID
+		if idParts := strings.Split(req.ID, ":"); len(idParts) == 2 {
+			id = idParts[1]
+			resp.Diagnostics.Append(
+				resp.State.SetAttribute(ctx, path.Root("site"), idParts[0])...)
+			resp.Diagnostics.Append(
+				resp.Identity.SetAttribute(ctx, path.Root("site"), idParts[0])...)
+		}
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), id)...)
+		resp.Diagnostics.Append(resp.Identity.SetAttribute(ctx, path.Root("id"), id)...)
+		return
+	}
+
+	// Import by resource identity (import block with identity, Terraform 1.12+).
+	var identity clientQosRateIdentityModel
+	resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+	if identity.Site.ValueString() != "" {
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
 	}
 }
 
 // Helper functions for conversion and merging
 
 func (r *clientQosRateResource) planToClientQosRate(
-	_ context.Context,
+	ctx context.Context,
 	plan clientQosRateResourceModel,
 ) (*unifi.ClientGroup, diag.Diagnostics) {
 	var diags diag.Diagnostics
@@ -357,17 +604,24 @@ func (r *clientQosRateResource) planToClientQosRate(
 	}
 
 	clientGroup := &unifi.ClientGroup{
-		ID:             plan.ID.ValueString(),
-		Name:           plan.Name.ValueString(),
-		QOSRateMaxDown: plan.QOSRateMaxDown.ValueInt64Pointer(),
-		QOSRateMaxUp:   plan.QOSRateMaxUp.ValueInt64Pointer(),
+		ID:   plan.ID.ValueString(),
+		Name: plan.Name.ValueString(),
+	}
+
+	// A null/unknown qos_rate object contributes nothing, exactly as unset
+	// flat leaves did; an unknown leaf yields a nil pointer the same way.
+	rate, ok, d := util.ObjectAs[clientQosRateRateModel](ctx, plan.QOSRate)
+	diags.Append(d...)
+	if ok {
+		clientGroup.QOSRateMaxDown = rate.MaxDown.ValueInt64Pointer()
+		clientGroup.QOSRateMaxUp = rate.MaxUp.ValueInt64Pointer()
 	}
 
 	return clientGroup, diags
 }
 
 func (r *clientQosRateResource) clientQosRateToModel(
-	_ context.Context,
+	ctx context.Context,
 	clientGroup *unifi.ClientGroup,
 	model *clientQosRateResourceModel,
 	site string,
@@ -385,8 +639,130 @@ func (r *clientQosRateResource) clientQosRateToModel(
 	model.ID = types.StringValue(clientGroup.ID)
 	model.Site = types.StringValue(site)
 	model.Name = types.StringValue(clientGroup.Name)
-	model.QOSRateMaxDown = types.Int64PointerValue(clientGroup.QOSRateMaxDown)
-	model.QOSRateMaxUp = types.Int64PointerValue(clientGroup.QOSRateMaxUp)
+
+	rate, d := types.ObjectValueFrom(ctx, clientQosRateRateAttrTypes(), clientQosRateRateModel{
+		MaxDown: types.Int64PointerValue(clientGroup.QOSRateMaxDown),
+		MaxUp:   types.Int64PointerValue(clientGroup.QOSRateMaxUp),
+	})
+	diags.Append(d...)
+	model.QOSRate = rate
 
 	return diags
+}
+
+// ListResourceConfigSchema implements [list.ListResource].
+func (r *clientQosRateResource) ListResourceConfigSchema(
+	_ context.Context,
+	_ list.ListResourceSchemaRequest,
+	resp *list.ListResourceSchemaResponse,
+) {
+	resp.Schema = listschema.Schema{
+		MarkdownDescription: "List client QOS rates in a site.",
+		Attributes: map[string]listschema.Attribute{
+			"site": listschema.StringAttribute{
+				MarkdownDescription: "The name of the site to list client QOS rates from.",
+				Optional:            true,
+			},
+		},
+		Blocks: map[string]listschema.Block{
+			"filter": listschema.ListNestedBlock{
+				NestedObject: listschema.NestedBlockObject{
+					Attributes: map[string]listschema.Attribute{
+						"name": listschema.StringAttribute{
+							MarkdownDescription: "The name of the filter to apply. Supported values are: `name`.",
+							Required:            true,
+						},
+						"value": listschema.StringAttribute{
+							MarkdownDescription: "The value to filter by.",
+							Required:            true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// List implements [list.ListResource].
+func (r *clientQosRateResource) List(
+	ctx context.Context,
+	req list.ListRequest,
+	stream *list.ListResultsStream,
+) {
+	var config clientQosRateListConfigModel
+
+	diags := req.Config.Get(ctx, &config)
+	if diags.HasError() {
+		stream.Results = list.ListResultsStreamDiagnostics(diags)
+		return
+	}
+
+	site := config.Site.ValueString()
+	if site == "" {
+		site = r.client.Site
+	}
+
+	// Process filter blocks.
+	var filters []clientQosRateListFilterModel
+	if !config.Filter.IsNull() && !config.Filter.IsUnknown() {
+		config.Filter.ElementsAs(ctx, &filters, false)
+	}
+
+	postFilters := make(map[string]string)
+	for _, f := range filters {
+		postFilters[f.Name.ValueString()] = f.Value.ValueString()
+	}
+
+	clientGroups, err := r.client.ListClientGroup(ctx, site)
+	if err != nil {
+		var d diag.Diagnostics
+		d.AddError(
+			"Error Listing Client QOS Rates",
+			"Could not list client QOS rates: "+err.Error(),
+		)
+		stream.Results = list.ListResultsStreamDiagnostics(d)
+		return
+	}
+
+	stream.Results = func(push func(list.ListResult) bool) {
+		for i := range clientGroups {
+			clientGroup := clientGroups[i]
+
+			// Apply name filter.
+			if val, ok := postFilters["name"]; ok {
+				if clientGroup.Name != val {
+					continue
+				}
+			}
+
+			result := req.NewListResult(ctx)
+
+			// Display name: prefer name, fall back to ID.
+			if clientGroup.Name != "" {
+				result.DisplayName = clientGroup.Name
+			} else {
+				result.DisplayName = clientGroup.ID
+			}
+
+			// Set identity.
+			result.Diagnostics.Append(result.Identity.Set(ctx, clientQosRateIdentityModel{
+				ID:   types.StringValue(clientGroup.ID),
+				Site: types.StringValue(site),
+			})...)
+
+			// Convert to model. Pre-populate the identifier so the converter's
+			// ID/Name guard is satisfied.
+			var model clientQosRateResourceModel
+			model.ID = types.StringValue(clientGroup.ID)
+			result.Diagnostics.Append(r.clientQosRateToModel(ctx, &clientGroup, &model, site)...)
+			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
+				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
+			}
+
+			if !push(result) {
+				return
+			}
+		}
+	}
 }

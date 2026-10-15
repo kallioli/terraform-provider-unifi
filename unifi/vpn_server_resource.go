@@ -2,11 +2,15 @@ package unifi
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/base64"
 	"fmt"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/hashicorp/terraform-plugin-framework-nettypes/cidrtypes"
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
 	"github.com/hashicorp/terraform-plugin-framework/attr"
@@ -33,9 +37,10 @@ import (
 
 // Ensure provider defined types fully satisfy framework interfaces.
 var (
-	_ resource.Resource                = &vpnServerResource{}
-	_ resource.ResourceWithImportState = &vpnServerResource{}
-	_ resource.ResourceWithIdentity    = &vpnServerResource{}
+	_ resource.Resource                 = &vpnServerResource{}
+	_ resource.ResourceWithImportState  = &vpnServerResource{}
+	_ resource.ResourceWithIdentity     = &vpnServerResource{}
+	_ resource.ResourceWithUpgradeState = &vpnServerResource{}
 )
 
 // Ensure provider defined types fully satisfy list interfaces.
@@ -58,7 +63,8 @@ type vpnServerResource struct {
 }
 
 type vpnServerIdentityModel struct {
-	ID types.String `tfsdk:"id"`
+	ID   types.String `tfsdk:"id"`
+	Site types.String `tfsdk:"site"`
 }
 
 // vpnServerListConfigModel describes the list configuration model.
@@ -127,35 +133,80 @@ func (m vpnServerL2TPModel) AttributeTypes() map[string]attr.Type {
 	}
 }
 
+// vpnServerCertPairModel is one controller-generated certificate/private key
+// pair inside the OpenVPN configuration (`ca`, `server`, `shared_client`).
+type vpnServerCertPairModel struct {
+	Crt types.String `tfsdk:"crt"`
+	Key types.String `tfsdk:"key"`
+}
+
+func (m vpnServerCertPairModel) AttributeTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"crt": types.StringType,
+		"key": types.StringType,
+	}
+}
+
 // vpnServerOpenVPNModel describes the OpenVPN-specific server configuration.
 type vpnServerOpenVPNModel struct {
 	Port             types.Int64  `tfsdk:"port"`
 	Mode             types.String `tfsdk:"mode"`
 	EncryptionCipher types.String `tfsdk:"encryption_cipher"`
-	ServerCrt        types.String `tfsdk:"server_crt"`
-	ServerKey        types.String `tfsdk:"server_key"`
+	Server           types.Object `tfsdk:"server"`
 	DhKey            types.String `tfsdk:"dh_key"`
-	SharedClientKey  types.String `tfsdk:"shared_client_key"`
-	SharedClientCrt  types.String `tfsdk:"shared_client_crt"`
+	SharedClient     types.Object `tfsdk:"shared_client"`
 	AuthKey          types.String `tfsdk:"auth_key"`
-	CaCrt            types.String `tfsdk:"ca_crt"`
-	CaKey            types.String `tfsdk:"ca_key"`
+	Ca               types.Object `tfsdk:"ca"`
 }
 
 func (m vpnServerOpenVPNModel) AttributeTypes() map[string]attr.Type {
+	certPair := types.ObjectType{AttrTypes: vpnServerCertPairModel{}.AttributeTypes()}
 	return map[string]attr.Type{
 		"port":              types.Int64Type,
 		"mode":              types.StringType,
 		"encryption_cipher": types.StringType,
-		"server_crt":        types.StringType,
-		"server_key":        types.StringType,
+		"server":            certPair,
 		"dh_key":            types.StringType,
-		"shared_client_key": types.StringType,
-		"shared_client_crt": types.StringType,
+		"shared_client":     certPair,
 		"auth_key":          types.StringType,
-		"ca_crt":            types.StringType,
-		"ca_key":            types.StringType,
+		"ca":                certPair,
 	}
+}
+
+// vpnServerCertPairPointers unpacks a `crt`/`key` object into the API's
+// pointer fields with exactly the wire semantics of the flat leaves it
+// replaced: a null object (or leaf) is a nil pointer and is omitted, while an
+// unknown object (create, before the controller has generated the material)
+// sends "" for both leaves just as the unknown flat leaves did via
+// ValueStringPointer, which the controller accepts and overwrites.
+func vpnServerCertPairPointers(
+	ctx context.Context,
+	obj types.Object,
+) (*string, *string, diag.Diagnostics) {
+	if obj.IsUnknown() {
+		return new(""), new(""), nil
+	}
+	pair, ok, diags := util.ObjectAs[vpnServerCertPairModel](ctx, obj)
+	if !ok {
+		return nil, nil, diags
+	}
+	return pair.Crt.ValueStringPointer(), pair.Key.ValueStringPointer(), diags
+}
+
+// vpnServerCertPairObject builds a `crt`/`key` object from the API's pointer
+// fields; a nil pointer becomes a null leaf.
+func vpnServerCertPairObject(
+	ctx context.Context,
+	crt, key *string,
+) (types.Object, diag.Diagnostics) {
+	return types.ObjectValueFrom(
+		ctx,
+		vpnServerCertPairModel{}.AttributeTypes(),
+		vpnServerCertPairModel{
+			Crt: types.StringPointerValue(crt),
+			Key: types.StringPointerValue(key),
+		},
+	)
 }
 
 // vpnServerResourceModel describes the resource data model.
@@ -171,6 +222,7 @@ type vpnServerResourceModel struct {
 	Wireguard       types.Object         `tfsdk:"wireguard"`
 	L2TP            types.Object         `tfsdk:"l2tp"`
 	OpenVPN         types.Object         `tfsdk:"openvpn"`
+	Timeouts        timeouts.Value       `tfsdk:"timeouts"`
 }
 
 func (r *vpnServerResource) Metadata(
@@ -188,12 +240,28 @@ func (r *vpnServerResource) IdentitySchema(
 	resp *resource.IdentitySchemaResponse,
 ) {
 	resp.IdentitySchema = identityschema.Schema{
+		Version: 1,
+		// The optional "site" attribute defaults to the provider site on
+		// import. Identities stored by older provider versions ({id} only)
+		// are version 0 and go through siteIdentityUpgraders, which fills
+		// site from the provider's configured site.
 		Attributes: map[string]identityschema.Attribute{
 			"id": identityschema.StringAttribute{
 				RequiredForImport: true,
 			},
+			"site": identityschema.StringAttribute{
+				OptionalForImport: true,
+			},
 		},
 	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity]. See
+// siteIdentityUpgraders.
+func (r *vpnServerResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return siteIdentityUpgraders(func() *Client { return r.client })
 }
 
 func (r *vpnServerResource) Schema(
@@ -208,6 +276,10 @@ func (r *vpnServerResource) Schema(
 
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "`unifi_vpn_server` manages VPN server configurations (WireGuard, L2TP, or OpenVPN) in the UniFi controller.",
+		// Version history:
+		//   0: initial schema (flat openvpn.{ca,server,shared_client}_{crt,key}).
+		//   1: the certificate/key pairs are nested objects. See UpgradeState.
+		Version: 1,
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -237,9 +309,12 @@ func (r *vpnServerResource) Schema(
 				Default:             booldefault.StaticBool(true),
 			},
 			"subnet": schema.StringAttribute{
-				MarkdownDescription: "The VPN server subnet in CIDR notation (e.g., `10.100.0.1/24`). The first address is the server's tunnel IP.",
-				Required:            true,
-				CustomType:          cidrtypes.IPv4PrefixType{},
+				MarkdownDescription: "The VPN server subnet in CIDR notation (e.g., `10.100.0.1/24`). " +
+					"The first address is the server's tunnel IP, so use the gateway form " +
+					"(`10.100.0.1/24`) — the network address (`10.100.0.0/24`) is rejected with " +
+					"`api.err.IncorrectIPSubnetSpec`.",
+				Required:   true,
+				CustomType: cidrtypes.IPv4PrefixType{},
 			},
 			"dns": schema.SingleNestedAttribute{
 				MarkdownDescription: "DNS configuration pushed to VPN clients.",
@@ -298,10 +373,15 @@ func (r *vpnServerResource) Schema(
 				Optional:            true,
 				Attributes: map[string]schema.Attribute{
 					"private_key": schema.StringAttribute{
-						MarkdownDescription: "WireGuard private key for this server. If not specified, one will be generated by the controller.",
-						Optional:            true,
-						Computed:            true,
-						Sensitive:           true,
+						MarkdownDescription: "WireGuard private key for this server (base64). If not " +
+							"specified, the provider generates one at create time (the controller " +
+							"does not generate it and rejects a server without a key).",
+						Optional:  true,
+						Computed:  true,
+						Sensitive: true,
+						PlanModifiers: []planmodifier.String{
+							stringplanmodifier.UseStateForUnknown(),
+						},
 					},
 					"public_key": schema.StringAttribute{
 						MarkdownDescription: "WireGuard public key for this server. Computed from the private key.",
@@ -369,22 +449,7 @@ func (r *vpnServerResource) Schema(
 							stringvalidator.OneOf("AES_256_GCM", "AES_256_CBC", "BF_CBC"),
 						},
 					},
-					"server_crt": schema.StringAttribute{
-						MarkdownDescription: "Server certificate generated by the controller.",
-						Computed:            true,
-						Sensitive:           true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
-						},
-					},
-					"server_key": schema.StringAttribute{
-						MarkdownDescription: "Server private key generated by the controller.",
-						Computed:            true,
-						Sensitive:           true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
-						},
-					},
+					"server": vpnServerCertPairSchema("Server"),
 					"dh_key": schema.StringAttribute{
 						MarkdownDescription: "Diffie-Hellman parameters generated by the controller.",
 						Computed:            true,
@@ -393,22 +458,7 @@ func (r *vpnServerResource) Schema(
 							stringplanmodifier.UseStateForUnknown(),
 						},
 					},
-					"shared_client_key": schema.StringAttribute{
-						MarkdownDescription: "Shared client private key generated by the controller.",
-						Computed:            true,
-						Sensitive:           true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
-						},
-					},
-					"shared_client_crt": schema.StringAttribute{
-						MarkdownDescription: "Shared client certificate generated by the controller.",
-						Computed:            true,
-						Sensitive:           true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
-						},
-					},
+					"shared_client": vpnServerCertPairSchema("Shared client"),
 					"auth_key": schema.StringAttribute{
 						MarkdownDescription: "OpenVPN static authentication key generated by the controller.",
 						Computed:            true,
@@ -417,26 +467,113 @@ func (r *vpnServerResource) Schema(
 							stringplanmodifier.UseStateForUnknown(),
 						},
 					},
-					"ca_crt": schema.StringAttribute{
-						MarkdownDescription: "CA certificate generated by the controller.",
-						Computed:            true,
-						Sensitive:           true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
-						},
-					},
-					"ca_key": schema.StringAttribute{
-						MarkdownDescription: "CA private key generated by the controller.",
-						Computed:            true,
-						Sensitive:           true,
-						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
-						},
-					},
+					"ca": vpnServerCertPairSchema("CA"),
+				},
+			},
+			"timeouts": timeouts.Attributes(ctx, timeouts.Opts{
+				Create: true,
+				Read:   true,
+				Update: true,
+				Delete: true,
+			}),
+		},
+	}
+}
+
+// vpnServerCertPairSchema is the schema of one controller-generated
+// certificate/private key pair (`ca`, `server`, `shared_client`) inside
+// `openvpn`. Both leaves are computed and sensitive, and the object is
+// resolved from prior state on plan just like the flat leaves it replaced.
+func vpnServerCertPairSchema(what string) schema.SingleNestedAttribute {
+	return schema.SingleNestedAttribute{
+		MarkdownDescription: what + " certificate and private key generated by the controller.",
+		Computed:            true,
+		PlanModifiers: []planmodifier.Object{
+			objectplanmodifier.UseStateForUnknown(),
+		},
+		Attributes: map[string]schema.Attribute{
+			"crt": schema.StringAttribute{
+				MarkdownDescription: what + " certificate generated by the controller.",
+				Computed:            true,
+				Sensitive:           true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
+				},
+			},
+			"key": schema.StringAttribute{
+				MarkdownDescription: what + " private key generated by the controller.",
+				Computed:            true,
+				Sensitive:           true,
+				PlanModifiers: []planmodifier.String{
+					stringplanmodifier.UseStateForUnknown(),
 				},
 			},
 		},
 	}
+}
+
+// UpgradeState migrates prior VPN server state to the current schema version.
+//
+//	v0 -> v1: the flat openvpn.{ca,server,shared_client}_{crt,key} attributes
+//	    move into nested openvpn.{ca,server,shared_client} = { crt, key }
+//	    objects. See nestVPNServerState.
+func (r *vpnServerResource) UpgradeState(
+	ctx context.Context,
+) map[int64]resource.StateUpgrader {
+	var schemaResp resource.SchemaResponse
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	upgrader := func(rewrite func(state map[string]any)) resource.StateUpgrader {
+		return resource.StateUpgrader{
+			StateUpgrader: func(
+				ctx context.Context,
+				req resource.UpgradeStateRequest,
+				resp *resource.UpgradeStateResponse,
+			) {
+				if req.RawState == nil {
+					return
+				}
+				dv, err := util.UpgradeRawState(
+					schemaType,
+					req.RawState.JSON,
+					func(state map[string]any) {
+						rewrite(state)
+						nestVPNServerState(state)
+					},
+				)
+				if err != nil {
+					resp.Diagnostics.AddError("Failed to upgrade VPN server state", err.Error())
+					return
+				}
+				resp.DynamicValue = dv
+			},
+		}
+	}
+
+	return map[int64]resource.StateUpgrader{
+		0: upgrader(func(map[string]any) {}),
+	}
+}
+
+// nestVPNServerState rewrites flat v0 VPN server state into the nested-object
+// shape of the current schema: the OpenVPN certificate/key attributes move
+// under openvpn.{ca,server,shared_client}.
+func nestVPNServerState(state map[string]any) {
+	util.WithObject(state, "openvpn", func(openvpn map[string]any) {
+		util.NestFields(openvpn, "ca", map[string]string{
+			"ca_crt": "crt",
+			"ca_key": "key",
+		})
+		util.NestFields(openvpn, "server", map[string]string{
+			"server_crt": "crt",
+			"server_key": "key",
+		})
+		util.NestFields(openvpn, "shared_client", map[string]string{
+			"shared_client_crt": "crt",
+			"shared_client_key": "key",
+		})
+	})
 }
 
 func (r *vpnServerResource) Configure(
@@ -475,6 +612,14 @@ func (r *vpnServerResource) Create(
 		return
 	}
 
+	createTimeout, timeoutDiags := data.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
 	network, diags := r.modelToNetwork(ctx, &data)
 	resp.Diagnostics.Append(diags...)
 	if resp.Diagnostics.HasError() {
@@ -507,7 +652,7 @@ func (r *vpnServerResource) Create(
 		return
 	}
 
-	idModel := vpnServerIdentityModel{ID: data.ID}
+	idModel := vpnServerIdentityModel{ID: data.ID, Site: data.Site}
 	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
@@ -524,20 +669,51 @@ func (r *vpnServerResource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Get the resource identity, tolerating null/empty identities (state
+	// written by older provider versions).
+	var identity vpnServerIdentityModel
+	if req.Identity != nil && !req.Identity.Raw.IsNull() {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+
 	site := data.Site.ValueString()
 	if site == "" {
+		site = identity.Site.ValueString()
+	}
+	if site == "" {
 		site = r.client.Site
+	}
+
+	// Prefer the state ID; fall back to the identity ID (the post-import
+	// refresh may run from an identity-only state).
+	lookupID := ""
+	if !data.ID.IsNull() && !data.ID.IsUnknown() {
+		lookupID = data.ID.ValueString()
+	}
+	if lookupID == "" && !identity.ID.IsNull() && !identity.ID.IsUnknown() {
+		lookupID = identity.ID.ValueString()
 	}
 
 	var err error
 	var network *unifi.Network
 
-	if !data.ID.IsNull() && !data.ID.IsUnknown() {
-		network, err = r.client.GetNetwork(ctx, site, data.ID.ValueString())
+	if lookupID != "" {
+		network, err = r.client.GetNetwork(ctx, site, lookupID)
 		if err != nil {
 			resp.Diagnostics.AddError(
 				"Error Reading VPN Server",
-				"Could not read VPN server ID "+data.ID.ValueString()+": "+err.Error(),
+				"Could not read VPN server ID "+lookupID+": "+err.Error(),
 			)
 			return
 		}
@@ -564,8 +740,13 @@ func (r *vpnServerResource) Read(
 		return
 	}
 
-	idModel := vpnServerIdentityModel{ID: data.ID}
-	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	// Terraform rejects any modification of an existing stored identity
+	// (including filling a null attribute), so pass an incoming identity
+	// through unchanged and only derive one when none is stored yet.
+	if resp.Identity != nil && (req.Identity == nil || req.Identity.Raw.IsNull()) {
+		idModel := vpnServerIdentityModel{ID: data.ID, Site: data.Site}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -580,6 +761,14 @@ func (r *vpnServerResource) Update(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	updateTimeout, timeoutDiags := data.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
 
 	network, diags := r.modelToNetwork(ctx, &data)
 	resp.Diagnostics.Append(diags...)
@@ -615,8 +804,12 @@ func (r *vpnServerResource) Update(
 		return
 	}
 
-	idModel := vpnServerIdentityModel{ID: data.ID}
-	resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	// Pass an existing identity through unchanged; only derive one when
+	// none is stored yet (see Read).
+	if resp.Identity != nil && (req.Identity == nil || req.Identity.Raw.IsNull()) {
+		idModel := vpnServerIdentityModel{ID: data.ID, Site: data.Site}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	}
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -631,6 +824,14 @@ func (r *vpnServerResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := data.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	site := data.Site.ValueString()
 	if site == "" {
@@ -653,31 +854,69 @@ func (r *vpnServerResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	idParts := strings.Split(req.ID, ":")
-	if len(idParts) == 2 {
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), idParts[0])...)
-		req.ID = idParts[1]
-	}
-
-	if strings.HasPrefix(req.ID, "name=") {
-		req.ID = strings.TrimPrefix(req.ID, "name=")
-		resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
-	} else if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(req.ID) {
-		idModel := vpnServerIdentityModel{ID: types.StringValue(req.ID)}
-		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+	// Identity-based import (Terraform 1.12+ import block with identity).
+	if req.ID == "" {
+		if req.Identity == nil {
+			resp.Diagnostics.AddError(
+				"Invalid Import Request",
+				"Importing a VPN server requires either an import ID or a resource identity.",
+			)
+			return
+		}
+		var identity vpnServerIdentityModel
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
 		if resp.Diagnostics.HasError() {
 			return
 		}
-		resource.ImportStatePassthroughWithIdentity(
-			ctx,
-			path.Root("id"),
-			path.Root("id"),
-			req,
-			resp,
-		)
-	} else {
-		resource.ImportStatePassthroughID(ctx, path.Root("name"), req, resp)
+		if identity.ID.IsNull() || identity.ID.ValueString() == "" {
+			resp.Diagnostics.AddError(
+				"Invalid Import Identity",
+				"The `id` identity attribute is required to import a VPN server.",
+			)
+			return
+		}
+		if identity.Site.IsNull() || identity.Site.ValueString() == "" {
+			identity.Site = types.StringValue(r.client.Site)
+		}
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &identity)...)
+		return
 	}
+
+	// Classic string import: "id", "site:id", "name=<name>", "site:name=<name>",
+	// or a bare network name.
+	importID := req.ID
+	site := ""
+	if idParts := strings.Split(importID, ":"); len(idParts) == 2 {
+		site = idParts[0]
+		importID = idParts[1]
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), site)...)
+	}
+	if site == "" {
+		site = r.client.Site
+	}
+
+	if name, ok := strings.CutPrefix(importID, "name="); ok {
+		// Import by name; Read resolves the ID and fills the identity.
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), name)...)
+		return
+	}
+
+	if regexp.MustCompile(`^[0-9a-f]{24}$`).MatchString(importID) {
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), importID)...)
+		idModel := vpnServerIdentityModel{
+			ID:   types.StringValue(importID),
+			Site: types.StringValue(site),
+		}
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, &idModel)...)
+		return
+	}
+
+	// Fall back to import by name; Read resolves the ID and fills the identity.
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("name"), importID)...)
 }
 
 // modelToNetwork converts from Terraform model to unifi.Network.
@@ -692,7 +931,7 @@ func (r *vpnServerResource) modelToNetwork(
 		Purpose:           unifi.PurposeUserVPN,
 		Enabled:           model.Enabled.ValueBool(),
 		IPSubnet:          model.Subnet.ValueStringPointer(),
-		SettingPreference: util.Ptr("manual"),
+		SettingPreference: new("manual"),
 	}
 
 	// Determine VPN type from which nested block is configured
@@ -702,11 +941,11 @@ func (r *vpnServerResource) modelToNetwork(
 
 	switch {
 	case hasWireguard:
-		network.VPNType = util.Ptr("wireguard-server")
+		network.VPNType = new("wireguard-server")
 	case hasL2TP:
-		network.VPNType = util.Ptr("l2tp-server")
+		network.VPNType = new("l2tp-server")
 	case hasOpenVPN:
-		network.VPNType = util.Ptr("openvpn-server")
+		network.VPNType = new("openvpn-server")
 	default:
 		diags.AddError(
 			"Missing VPN Type Configuration",
@@ -731,14 +970,14 @@ func (r *vpnServerResource) modelToNetwork(
 				diags.Append(d...)
 				if !diags.HasError() {
 					if len(dnsServers) > 0 {
-						network.DHCPDDNS1 = dnsServers[0]
+						network.DHCPDDNS1 = new(dnsServers[0])
 						// Default enabled to true when servers are specified
 						if dns.Enabled.IsNull() || dns.Enabled.IsUnknown() {
 							network.DHCPDDNSEnabled = true
 						}
 					}
 					if len(dnsServers) > 1 {
-						network.DHCPDDNS2 = dnsServers[1]
+						network.DHCPDDNS2 = new(dnsServers[1])
 					}
 				}
 			}
@@ -778,6 +1017,17 @@ func (r *vpnServerResource) modelToNetwork(
 		if !diags.HasError() {
 			if !wireguard.PrivateKey.IsNull() && !wireguard.PrivateKey.IsUnknown() {
 				network.WireguardPrivateKey = wireguard.PrivateKey.ValueStringPointer()
+			} else {
+				// The controller does not generate a key on create (it rejects
+				// with api.err.WireguardMissingPrivateKey), so generate one
+				// provider-side. On update the key is resolved from state via
+				// UseStateForUnknown, so this branch only runs at create.
+				key, err := generateWireGuardPrivateKey()
+				if err != nil {
+					diags.AddError("Unable to generate WireGuard private key", err.Error())
+				} else {
+					network.WireguardPrivateKey = &key
+				}
 			}
 			network.LocalPort = wireguard.Port.ValueInt64Pointer()
 		}
@@ -804,15 +1054,23 @@ func (r *vpnServerResource) modelToNetwork(
 			network.OpenVPNMode = openvpn.Mode.ValueStringPointer()
 			network.OpenVPNEncryptionCipher = openvpn.EncryptionCipher.ValueStringPointer()
 
-			// Send computed certificate/key fields back on updates
-			network.ServerCrt = openvpn.ServerCrt.ValueStringPointer()
-			network.ServerKey = openvpn.ServerKey.ValueStringPointer()
+			// Send computed certificate/key fields back on updates; on create
+			// the not-yet-generated pairs go out as "" like the flat leaves did.
+			var pd diag.Diagnostics
+			network.ServerCrt, network.ServerKey, pd = vpnServerCertPairPointers(
+				ctx,
+				openvpn.Server,
+			)
+			diags.Append(pd...)
 			network.DhKey = openvpn.DhKey.ValueStringPointer()
-			network.SharedClientKey = openvpn.SharedClientKey.ValueStringPointer()
-			network.SharedClientCrt = openvpn.SharedClientCrt.ValueStringPointer()
+			network.SharedClientCrt, network.SharedClientKey, pd = vpnServerCertPairPointers(
+				ctx,
+				openvpn.SharedClient,
+			)
+			diags.Append(pd...)
 			network.AuthKey = openvpn.AuthKey.ValueStringPointer()
-			network.CaCrt = openvpn.CaCrt.ValueStringPointer()
-			network.CaKey = openvpn.CaKey.ValueStringPointer()
+			network.CaCrt, network.CaKey, pd = vpnServerCertPairPointers(ctx, openvpn.Ca)
+			diags.Append(pd...)
 		}
 	}
 
@@ -842,13 +1100,7 @@ func (r *vpnServerResource) networkToModel(
 	// Build DNS nested object
 	{
 		var dnsServersList types.List
-		var dnsServers []string
-		if network.DHCPDDNS1 != "" {
-			dnsServers = append(dnsServers, network.DHCPDDNS1)
-		}
-		if network.DHCPDDNS2 != "" {
-			dnsServers = append(dnsServers, network.DHCPDDNS2)
-		}
+		dnsServers := collectNonEmptyStringPointers(network.DHCPDDNS1, network.DHCPDDNS2)
 		if len(dnsServers) > 0 {
 			var d diag.Diagnostics
 			dnsServersList, d = types.ListValueFrom(ctx, types.StringType, dnsServers)
@@ -964,20 +1216,26 @@ func (r *vpnServerResource) networkToModel(
 		model.OpenVPN = types.ObjectNull(vpnServerOpenVPNModel{}.AttributeTypes())
 
 	case "openvpn-server":
+		server, d := vpnServerCertPairObject(ctx, network.ServerCrt, network.ServerKey)
+		diags.Append(d...)
+		sharedClient, d := vpnServerCertPairObject(
+			ctx,
+			network.SharedClientCrt,
+			network.SharedClientKey,
+		)
+		diags.Append(d...)
+		ca, d := vpnServerCertPairObject(ctx, network.CaCrt, network.CaKey)
+		diags.Append(d...)
 		openvpnValue := vpnServerOpenVPNModel{
 			Port:             types.Int64PointerValue(network.LocalPort),
 			Mode:             types.StringPointerValue(network.OpenVPNMode),
 			EncryptionCipher: types.StringPointerValue(network.OpenVPNEncryptionCipher),
-			ServerCrt:        types.StringPointerValue(network.ServerCrt),
-			ServerKey:        types.StringPointerValue(network.ServerKey),
+			Server:           server,
 			DhKey:            types.StringPointerValue(network.DhKey),
-			SharedClientKey:  types.StringPointerValue(network.SharedClientKey),
-			SharedClientCrt:  types.StringPointerValue(network.SharedClientCrt),
+			SharedClient:     sharedClient,
 			AuthKey:          types.StringPointerValue(network.AuthKey),
-			CaCrt:            types.StringPointerValue(network.CaCrt),
-			CaKey:            types.StringPointerValue(network.CaKey),
+			Ca:               ca,
 		}
-		var d diag.Diagnostics
 		model.OpenVPN, d = types.ObjectValueFrom(
 			ctx,
 			vpnServerOpenVPNModel{}.AttributeTypes(),
@@ -1089,11 +1347,10 @@ func (r *vpnServerResource) List(
 
 			// Set identity.
 			result.Diagnostics.Append(
-				result.Identity.SetAttribute(
-					ctx,
-					path.Root("id"),
-					types.StringValue(network.ID),
-				)...,
+				result.Identity.Set(ctx, vpnServerIdentityModel{
+					ID:   types.StringValue(network.ID),
+					Site: types.StringValue(site),
+				})...,
 			)
 
 			// Convert to model.
@@ -1101,6 +1358,7 @@ func (r *vpnServerResource) List(
 			result.Diagnostics.Append(
 				r.networkToModel(ctx, &network, &model, site, &vpnServerResourceModel{})...)
 			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
 				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
 			}
 
@@ -1109,4 +1367,20 @@ func (r *vpnServerResource) List(
 			}
 		}
 	}
+}
+
+// generateWireGuardPrivateKey returns a fresh base64-encoded Curve25519 private
+// key in the WireGuard format. The UniFi controller does not generate a key for
+// a WireGuard VPN server (it rejects creation with api.err.WireguardMissingPrivateKey),
+// so the provider generates one when the user does not supply it.
+func generateWireGuardPrivateKey() (string, error) {
+	var key [32]byte
+	if _, err := rand.Read(key[:]); err != nil {
+		return "", err
+	}
+	// Curve25519 clamping, per the WireGuard key format.
+	key[0] &= 248
+	key[31] &= 127
+	key[31] |= 64
+	return base64.StdEncoding.EncodeToString(key[:]), nil
 }

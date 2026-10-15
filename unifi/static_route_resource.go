@@ -3,21 +3,31 @@ package unifi
 import (
 	"context"
 	"fmt"
-	"net"
+	"net/netip"
 	"strings"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-nettypes/iptypes"
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/resource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework-validators/int64validator"
 	"github.com/hashicorp/terraform-plugin-framework-validators/stringvalidator"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	"github.com/hashicorp/terraform-plugin-framework/list"
+	listschema "github.com/hashicorp/terraform-plugin-framework/list/schema"
 	"github.com/hashicorp/terraform-plugin-framework/path"
 	"github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/identityschema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/booldefault"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/objectdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringdefault"
 	"github.com/hashicorp/terraform-plugin-framework/resource/schema/stringplanmodifier"
 	"github.com/hashicorp/terraform-plugin-framework/schema/validator"
 	"github.com/hashicorp/terraform-plugin-framework/types"
 	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/validators"
 )
 
@@ -26,9 +36,21 @@ var (
 	_ resource.Resource                     = &staticRouteFrameworkResource{}
 	_ resource.ResourceWithImportState      = &staticRouteFrameworkResource{}
 	_ resource.ResourceWithConfigValidators = &staticRouteFrameworkResource{}
+	_ resource.ResourceWithIdentity         = &staticRouteFrameworkResource{}
+	_ resource.ResourceWithUpgradeState     = &staticRouteFrameworkResource{}
+)
+
+// Ensure provider defined types fully satisfy list interfaces.
+var (
+	_ list.ListResource              = &staticRouteFrameworkResource{}
+	_ list.ListResourceWithConfigure = &staticRouteFrameworkResource{}
 )
 
 func NewStaticRouteFrameworkResource() resource.Resource {
+	return &staticRouteFrameworkResource{}
+}
+
+func NewStaticRouteListResource() list.ListResource {
 	return &staticRouteFrameworkResource{}
 }
 
@@ -37,19 +59,61 @@ type staticRouteFrameworkResource struct {
 	client *Client
 }
 
+// staticRouteListConfigModel describes the list configuration model.
+type staticRouteListConfigModel struct {
+	Site   types.String `tfsdk:"site"`
+	Filter types.List   `tfsdk:"filter"`
+}
+
+// staticRouteListFilterModel represents a single name/value filter entry.
+type staticRouteListFilterModel struct {
+	Name  types.String `tfsdk:"name"`
+	Value types.String `tfsdk:"value"`
+}
+
+// staticRouteIdentityModel describes the resource identity data model.
+type staticRouteIdentityModel struct {
+	ID   types.String `tfsdk:"id"`
+	Site types.String `tfsdk:"site"`
+}
+
 // staticRouteFrameworkResourceModel describes the resource data model.
 type staticRouteFrameworkResourceModel struct {
-	ID            types.String `tfsdk:"id"`
-	Site          types.String `tfsdk:"site"`
-	Name          types.String `tfsdk:"name"`
-	Network       types.String `tfsdk:"network"`
-	Type          types.String `tfsdk:"type"`
-	Distance      types.Int64  `tfsdk:"distance"`
-	NextHop       types.String `tfsdk:"next_hop"`
-	Interface     types.String `tfsdk:"interface"`
-	Enabled       types.Bool   `tfsdk:"enabled"`
-	GatewayDevice types.String `tfsdk:"gateway_device"`
-	GatewayType   types.String `tfsdk:"gateway_type"`
+	ID        types.String      `tfsdk:"id"`
+	Site      types.String      `tfsdk:"site"`
+	Name      types.String      `tfsdk:"name"`
+	Network   types.String      `tfsdk:"network"`
+	Type      types.String      `tfsdk:"type"`
+	Distance  types.Int64       `tfsdk:"distance"`
+	NextHop   iptypes.IPAddress `tfsdk:"next_hop"`
+	Interface types.String      `tfsdk:"interface"`
+	Enabled   types.Bool        `tfsdk:"enabled"`
+	Gateway   types.Object      `tfsdk:"gateway"`
+	Timeouts  timeouts.Value    `tfsdk:"timeouts"`
+}
+
+// staticRouteGatewayModel is the `gateway` nested object.
+type staticRouteGatewayModel struct {
+	Device types.String `tfsdk:"device"`
+	Type   types.String `tfsdk:"type"`
+}
+
+func staticRouteGatewayAttrTypes() map[string]attr.Type {
+	return map[string]attr.Type{
+		"device": types.StringType,
+		"type":   types.StringType,
+	}
+}
+
+// staticRouteGatewayDefault reproduces the values the flat gateway_type and
+// gateway_device attributes sent when the practitioner left them out of
+// configuration (`default` and unset), so the request body on create is
+// unchanged when the whole `gateway` block is omitted.
+func staticRouteGatewayDefault() types.Object {
+	return types.ObjectValueMust(staticRouteGatewayAttrTypes(), map[string]attr.Value{
+		"device": types.StringNull(),
+		"type":   types.StringValue("default"),
+	})
 }
 
 func (r *staticRouteFrameworkResource) Metadata(
@@ -60,6 +124,33 @@ func (r *staticRouteFrameworkResource) Metadata(
 	resp.TypeName = req.ProviderTypeName + "_static_route"
 }
 
+// IdentitySchema implements [resource.ResourceWithIdentity].
+func (r *staticRouteFrameworkResource) IdentitySchema(
+	_ context.Context,
+	_ resource.IdentitySchemaRequest,
+	resp *resource.IdentitySchemaResponse,
+) {
+	resp.IdentitySchema = identityschema.Schema{
+		Version: 1,
+		Attributes: map[string]identityschema.Attribute{
+			"id": identityschema.StringAttribute{
+				RequiredForImport: true,
+			},
+			"site": identityschema.StringAttribute{
+				OptionalForImport: true,
+			},
+		},
+	}
+}
+
+// UpgradeIdentity implements [resource.ResourceWithUpgradeIdentity]. See
+// siteIdentityUpgraders.
+func (r *staticRouteFrameworkResource) UpgradeIdentity(
+	_ context.Context,
+) map[int64]resource.IdentityUpgrader {
+	return siteIdentityUpgraders(func() *Client { return r.client })
+}
+
 func (r *staticRouteFrameworkResource) Schema(
 	ctx context.Context,
 	req resource.SchemaRequest,
@@ -67,6 +158,7 @@ func (r *staticRouteFrameworkResource) Schema(
 ) {
 	resp.Schema = schema.Schema{
 		MarkdownDescription: "Manages a static route for the USG.",
+		Version:             1,
 
 		Attributes: map[string]schema.Attribute{
 			"id": schema.StringAttribute{
@@ -112,6 +204,7 @@ func (r *staticRouteFrameworkResource) Schema(
 			},
 			"next_hop": schema.StringAttribute{
 				MarkdownDescription: "The next hop of the static route (only valid for `nexthop-route` type). Accepts IPv4 or IPv6 addresses.",
+				CustomType:          iptypes.IPAddressType{},
 				Optional:            true,
 				Validators: []validator.String{
 					stringvalidator.Any(validators.IPv4Validator(), validators.IPv6Validator()),
@@ -127,24 +220,82 @@ func (r *staticRouteFrameworkResource) Schema(
 				Computed:            true,
 				Default:             booldefault.StaticBool(true),
 			},
-			"gateway_device": schema.StringAttribute{
-				MarkdownDescription: "The MAC address of the gateway device, used when `gateway_type` is `switch`.",
-				Optional:            true,
-				Validators: []validator.String{
-					validators.MACAddressValidator(),
-				},
-			},
-			"gateway_type": schema.StringAttribute{
-				MarkdownDescription: "The type of gateway for the static route. Can be `default` or `switch`.",
+			"gateway": schema.SingleNestedAttribute{
+				MarkdownDescription: "The gateway that applies the static route.",
 				Optional:            true,
 				Computed:            true,
-				Default:             stringdefault.StaticString("default"),
-				Validators: []validator.String{
-					stringvalidator.OneOf("default", "switch"),
+				Default:             objectdefault.StaticValue(staticRouteGatewayDefault()),
+				Attributes: map[string]schema.Attribute{
+					"device": schema.StringAttribute{
+						MarkdownDescription: "The MAC address of the gateway device, used when `type` is `switch`.",
+						Optional:            true,
+						Validators: []validator.String{
+							validators.MACAddressValidator(),
+						},
+					},
+					"type": schema.StringAttribute{
+						MarkdownDescription: "The type of gateway for the static route. Can be `default` or `switch`.",
+						Optional:            true,
+						Computed:            true,
+						Default:             stringdefault.StaticString("default"),
+						Validators: []validator.String{
+							stringvalidator.OneOf("default", "switch"),
+						},
+					},
 				},
+			},
+			"timeouts": timeouts.Attributes(
+				ctx,
+				timeouts.Opts{Create: true, Read: true, Update: true, Delete: true},
+			),
+		},
+	}
+}
+
+// UpgradeState migrates prior static route state to the current schema version.
+//
+//	v0 -> current: the flat gateway_device and gateway_type attributes moved
+//	    into the nested `gateway` object. See nestStaticRouteState.
+func (r *staticRouteFrameworkResource) UpgradeState(
+	ctx context.Context,
+) map[int64]resource.StateUpgrader {
+	var schemaResp resource.SchemaResponse
+	r.Schema(ctx, resource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	return map[int64]resource.StateUpgrader{
+		0: {
+			StateUpgrader: func(
+				ctx context.Context,
+				req resource.UpgradeStateRequest,
+				resp *resource.UpgradeStateResponse,
+			) {
+				if req.RawState == nil {
+					return
+				}
+				dv, err := util.UpgradeRawState(
+					schemaType,
+					req.RawState.JSON,
+					nestStaticRouteState,
+				)
+				if err != nil {
+					resp.Diagnostics.AddError("Failed to upgrade static route state", err.Error())
+					return
+				}
+				resp.DynamicValue = dv
 			},
 		},
 	}
+}
+
+// nestStaticRouteState rewrites flat v0 static route state into the
+// nested-object layout introduced in schema v1. Keys that are absent are
+// skipped.
+func nestStaticRouteState(state map[string]any) {
+	util.NestFields(state, "gateway", map[string]string{
+		"gateway_device": "device",
+		"gateway_type":   "type",
+	})
 }
 
 func (r *staticRouteFrameworkResource) Configure(
@@ -184,8 +335,20 @@ func (r *staticRouteFrameworkResource) Create(
 		return
 	}
 
+	createTimeout, timeoutDiags := data.Timeouts.Create(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, createTimeout)
+	defer cancel()
+
 	// Convert to unifi.Routing
-	routing := r.modelToRouting(ctx, &data)
+	routing, diags := r.modelToRouting(ctx, &data)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	site := data.Site.ValueString()
 	if site == "" {
@@ -203,9 +366,14 @@ func (r *staticRouteFrameworkResource) Create(
 	}
 
 	// Convert back to model
-	r.routingToModel(ctx, createdRouting, &data, site)
+	resp.Diagnostics.Append(r.routingToModel(ctx, createdRouting, &data, site)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Save data into Terraform state
+	identity := staticRouteIdentityModel{ID: data.ID, Site: data.Site}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -222,13 +390,55 @@ func (r *staticRouteFrameworkResource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
+	// Read identity, falling back to state for resources created before
+	// identity support. When an identity comes in it must be passed through
+	// unchanged: Terraform treats any modification of a non-null identity
+	// (including filling a null attribute) as an error.
+	haveIdentity := req.Identity != nil && !req.Identity.Raw.IsNull()
+	var identity staticRouteIdentityModel
+	if haveIdentity {
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	} else {
+		identity.ID = data.ID
+		identity.Site = data.Site
+	}
+
+	// Tolerate identity-only state (the refresh right after an identity-based
+	// import): fill the missing lookup keys from identity.
+	id := data.ID.ValueString()
+	if id == "" {
+		id = identity.ID.ValueString()
+	}
+
 	site := data.Site.ValueString()
+	if site == "" {
+		site = identity.Site.ValueString()
+	}
 	if site == "" {
 		site = r.client.Site
 	}
 
+	if id == "" {
+		resp.Diagnostics.AddError(
+			"Invalid State",
+			"Static route must have an ID",
+		)
+		return
+	}
+
 	// Get the static route from the API
-	routing, err := r.client.GetRouting(ctx, site, data.ID.ValueString())
+	routing, err := r.client.GetRouting(ctx, site, id)
 	if err != nil {
 		if _, ok := err.(*unifi.NotFoundError); ok {
 			resp.State.RemoveResource(ctx)
@@ -236,15 +446,24 @@ func (r *staticRouteFrameworkResource) Read(
 		}
 		resp.Diagnostics.AddError(
 			"Error Reading Static Route",
-			"Could not read static route with ID "+data.ID.ValueString()+": "+err.Error(),
+			"Could not read static route with ID "+id+": "+err.Error(),
 		)
 		return
 	}
 
 	// Convert to model
-	r.routingToModel(ctx, routing, &data, site)
+	resp.Diagnostics.Append(r.routingToModel(ctx, routing, &data, site)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
-	// Save updated data into Terraform state
+	// Save updated data into Terraform state. A pre-existing identity is
+	// re-set unchanged; a fresh one is derived from the refreshed state.
+	if !haveIdentity {
+		identity.ID = data.ID
+		identity.Site = data.Site
+	}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &data)...)
 }
 
@@ -268,8 +487,17 @@ func (r *staticRouteFrameworkResource) Update(
 		return
 	}
 
+	updateTimeout, timeoutDiags := plan.Timeouts.Update(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, updateTimeout)
+	defer cancel()
+
 	// Step 2: Apply the plan changes to the state object
 	r.applyPlanToState(ctx, &plan, &state)
+	state.Timeouts = plan.Timeouts
 
 	site := state.Site.ValueString()
 	if site == "" {
@@ -277,7 +505,11 @@ func (r *staticRouteFrameworkResource) Update(
 	}
 
 	// Step 3: Convert the updated state to API format
-	routing := r.modelToRouting(ctx, &state)
+	routing, diags := r.modelToRouting(ctx, &state)
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 	routing.ID = state.ID.ValueString()
 
 	// Step 4: Send to API
@@ -291,9 +523,21 @@ func (r *staticRouteFrameworkResource) Update(
 	}
 
 	// Step 5: Update state with API response
-	r.routingToModel(ctx, updatedRouting, &state, site)
+	resp.Diagnostics.Append(r.routingToModel(ctx, updatedRouting, &state, site)...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
 
 	// Save updated data into Terraform state
+	identity := staticRouteIdentityModel{ID: state.ID, Site: state.Site}
+	if req.Identity != nil && !req.Identity.Raw.IsNull() {
+		// Identity is immutable once set: carry the incoming identity through.
+		resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+		if resp.Diagnostics.HasError() {
+			return
+		}
+	}
+	resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 	resp.Diagnostics.Append(resp.State.Set(ctx, &state)...)
 }
 
@@ -309,6 +553,14 @@ func (r *staticRouteFrameworkResource) Delete(
 	if resp.Diagnostics.HasError() {
 		return
 	}
+
+	deleteTimeout, timeoutDiags := data.Timeouts.Delete(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, deleteTimeout)
+	defer cancel()
 
 	site := data.Site.ValueString()
 	if site == "" {
@@ -334,29 +586,46 @@ func (r *staticRouteFrameworkResource) ImportState(
 	req resource.ImportStateRequest,
 	resp *resource.ImportStateResponse,
 ) {
-	// Import format: "site:id" or just "id" for default site
-	idParts := strings.Split(req.ID, ":")
+	// Import by ID string (terraform import CLI, or import block with id set).
+	// Format: "site:id" or just "id" for the default site.
+	if req.ID != "" {
+		idParts := strings.Split(req.ID, ":")
 
-	if len(idParts) == 2 {
-		// site:id format
-		site := idParts[0]
-		id := idParts[1]
+		var identity staticRouteIdentityModel
+		switch len(idParts) {
+		case 2:
+			identity.Site = types.StringValue(idParts[0])
+			identity.ID = types.StringValue(idParts[1])
+			resp.Diagnostics.Append(
+				resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+		case 1:
+			// Just id, use default site
+			identity.ID = types.StringValue(req.ID)
+		default:
+			resp.Diagnostics.AddError(
+				"Invalid Import ID",
+				"Import ID must be in format 'site:id' or 'id'",
+			)
+			return
+		}
 
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("site"), site)...)
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), id)...)
+		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+		resp.Diagnostics.Append(resp.Identity.Set(ctx, identity)...)
 		return
 	}
 
-	if len(idParts) == 1 {
-		// Just id, use default site
-		resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), req.ID)...)
+	// Import by resource identity (import block with identity, Terraform 1.12+).
+	var identity staticRouteIdentityModel
+	resp.Diagnostics.Append(req.Identity.Get(ctx, &identity)...)
+	if resp.Diagnostics.HasError() {
 		return
 	}
 
-	resp.Diagnostics.AddError(
-		"Invalid Import ID",
-		"Import ID must be in format 'site:id' or 'id'",
-	)
+	resp.Diagnostics.Append(resp.State.SetAttribute(ctx, path.Root("id"), identity.ID)...)
+	if !identity.Site.IsNull() && identity.Site.ValueString() != "" {
+		resp.Diagnostics.Append(
+			resp.State.SetAttribute(ctx, path.Root("site"), identity.Site)...)
+	}
 }
 
 func (r *staticRouteFrameworkResource) ConfigValidators(
@@ -383,7 +652,10 @@ func (v *staticRouteIPVersionValidator) ValidateResource(
 	req resource.ValidateConfigRequest,
 	resp *resource.ValidateConfigResponse,
 ) {
-	var network, nextHop types.String
+	// next_hop uses the iptypes.IPAddress custom type, so it must be read into a
+	// matching value — reading it into types.String fails config conversion.
+	var network types.String
+	var nextHop iptypes.IPAddress
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("network"), &network)...)
 	resp.Diagnostics.Append(req.Config.GetAttribute(ctx, path.Root("next_hop"), &nextHop)...)
 	if resp.Diagnostics.HasError() {
@@ -395,30 +667,52 @@ func (v *staticRouteIPVersionValidator) ValidateResource(
 		return
 	}
 
-	if err := validateIPVersionMatch(network.ValueString(), nextHop.ValueString()); err != nil {
+	// Convert next_hop via the custom type's built-in netip.Addr conversion
+	// rather than re-parsing the raw string.
+	hopAddr, diags := nextHop.ValueIPAddress()
+	resp.Diagnostics.Append(diags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+
+	// network is a CIDR string (already shape-validated by CIDRValidator); parse
+	// it to a netip.Prefix so both sides are compared as netip values.
+	prefix, err := netip.ParsePrefix(network.ValueString())
+	if err != nil {
+		return // malformed CIDR is already reported by the network attribute validator
+	}
+
+	if !ipVersionsMatch(prefix, hopAddr) {
 		resp.Diagnostics.AddAttributeError(
 			path.Root("next_hop"),
 			"IP Version Mismatch",
-			err.Error(),
+			fmt.Sprintf(
+				"network %q and next_hop %q must use the same IP version (both IPv4 or both IPv6)",
+				network.ValueString(),
+				hopAddr.String(),
+			),
 		)
 	}
 }
 
+// ipVersionsMatch reports whether a CIDR prefix and an address use the same IP
+// family. Unmap collapses IPv4-mapped IPv6 addresses (::ffff:a.b.c.d) to IPv4 so
+// they compare as the v4 family.
+func ipVersionsMatch(prefix netip.Prefix, hop netip.Addr) bool {
+	return prefix.Addr().Unmap().Is4() == hop.Unmap().Is4()
+}
+
 // validateIPVersionMatch returns an error if network (CIDR) and nextHop (IP) use different IP versions.
 func validateIPVersionMatch(network, nextHop string) error {
-	_, ipNet, _ := net.ParseCIDR(network)
-	if ipNet == nil {
-		return nil // already caught by the field validator
-	}
-	hop := net.ParseIP(nextHop)
-	if hop == nil {
-		return nil // already caught by the field validator
+	// Invalid network/next_hop are already reported by their field validators;
+	// an invalid (zero) value here just means "nothing to compare".
+	prefix, _ := netip.ParsePrefix(network)
+	hop, _ := netip.ParseAddr(nextHop)
+	if !prefix.IsValid() || !hop.IsValid() {
+		return nil
 	}
 
-	networkIsIPv4 := ipNet.IP.To4() != nil
-	hopIsIPv4 := hop.To4() != nil
-
-	if networkIsIPv4 != hopIsIPv4 {
+	if !ipVersionsMatch(prefix, hop) {
 		return fmt.Errorf(
 			"network %q and next_hop %q must use the same IP version",
 			network,
@@ -433,7 +727,7 @@ var _ resource.ConfigValidator = &staticRouteIPVersionValidator{}
 
 // applyPlanToState merges plan values into state, preserving state values where plan is null/unknown.
 func (r *staticRouteFrameworkResource) applyPlanToState(
-	_ context.Context,
+	ctx context.Context,
 	plan *staticRouteFrameworkResourceModel,
 	state *staticRouteFrameworkResourceModel,
 ) {
@@ -459,19 +753,17 @@ func (r *staticRouteFrameworkResource) applyPlanToState(
 	if !plan.Enabled.IsNull() && !plan.Enabled.IsUnknown() {
 		state.Enabled = plan.Enabled
 	}
-	if !plan.GatewayDevice.IsNull() && !plan.GatewayDevice.IsUnknown() {
-		state.GatewayDevice = plan.GatewayDevice
-	}
-	if !plan.GatewayType.IsNull() && !plan.GatewayType.IsUnknown() {
-		state.GatewayType = plan.GatewayType
-	}
+	// Each known gateway leaf in the plan replaces its state counterpart; a
+	// null/unknown leaf (or the whole object) keeps the state value.
+	state.Gateway = util.OverlayKnownObject(ctx, plan.Gateway, state.Gateway)
 }
 
 // modelToRouting converts the Terraform model to the API struct.
 func (r *staticRouteFrameworkResource) modelToRouting(
-	_ context.Context,
+	ctx context.Context,
 	model *staticRouteFrameworkResourceModel,
-) *unifi.Routing {
+) (*unifi.Routing, diag.Diagnostics) {
+	var diags diag.Diagnostics
 	routeType := model.Type.ValueString()
 
 	routing := &unifi.Routing{
@@ -481,11 +773,17 @@ func (r *staticRouteFrameworkResource) modelToRouting(
 		StaticRouteNetwork:  model.Network.ValueString(), // TODO: Apply cidrZeroBased if needed
 		StaticRouteDistance: model.Distance.ValueInt64Pointer(),
 		StaticRouteType:     routeType,
-		GatewayType:         model.GatewayType.ValueString(),
 	}
 
-	if !model.GatewayDevice.IsNull() {
-		routing.GatewayDevice = model.GatewayDevice.ValueString()
+	// A null/unknown gateway object contributes nothing, exactly as unset
+	// flat leaves did.
+	gateway, ok, d := util.ObjectAs[staticRouteGatewayModel](ctx, model.Gateway)
+	diags.Append(d...)
+	if ok {
+		routing.GatewayType = gateway.Type.ValueString()
+		if !gateway.Device.IsNull() {
+			routing.GatewayDevice = gateway.Device.ValueString()
+		}
 	}
 
 	switch routeType {
@@ -501,16 +799,18 @@ func (r *staticRouteFrameworkResource) modelToRouting(
 		// No additional fields needed
 	}
 
-	return routing
+	return routing, diags
 }
 
 // routingToModel converts the API struct to the Terraform model.
 func (r *staticRouteFrameworkResource) routingToModel(
-	_ context.Context,
+	ctx context.Context,
 	routing *unifi.Routing,
 	model *staticRouteFrameworkResourceModel,
 	site string,
-) {
+) diag.Diagnostics {
+	var diags diag.Diagnostics
+
 	model.ID = types.StringValue(routing.ID)
 	model.Site = types.StringValue(site)
 	model.Name = types.StringValue(routing.Name)
@@ -518,10 +818,9 @@ func (r *staticRouteFrameworkResource) routingToModel(
 	model.Type = types.StringValue(routing.StaticRouteType)
 	model.Distance = types.Int64PointerValue(routing.StaticRouteDistance)
 
+	model.NextHop = iptypes.NewIPAddressNull()
 	if routing.StaticRouteNexthop != "" {
-		model.NextHop = types.StringValue(routing.StaticRouteNexthop)
-	} else {
-		model.NextHop = types.StringNull()
+		model.NextHop = iptypes.NewIPAddressValue(routing.StaticRouteNexthop)
 	}
 
 	if routing.StaticRouteInterface != "" {
@@ -532,15 +831,143 @@ func (r *staticRouteFrameworkResource) routingToModel(
 
 	model.Enabled = types.BoolValue(routing.Enabled)
 
-	if routing.GatewayDevice != "" {
-		model.GatewayDevice = types.StringValue(routing.GatewayDevice)
-	} else {
-		model.GatewayDevice = types.StringNull()
+	// The controller omits gateway_type for the default gateway; surface it as
+	// `default` so it matches the schema default.
+	gatewayType := routing.GatewayType
+	if gatewayType == "" {
+		gatewayType = "default"
+	}
+	gateway, d := types.ObjectValueFrom(ctx, staticRouteGatewayAttrTypes(), staticRouteGatewayModel{
+		Device: stringOrNull(routing.GatewayDevice),
+		Type:   types.StringValue(gatewayType),
+	})
+	diags.Append(d...)
+	model.Gateway = gateway
+
+	return diags
+}
+
+// ListResourceConfigSchema implements [list.ListResource].
+func (r *staticRouteFrameworkResource) ListResourceConfigSchema(
+	_ context.Context,
+	_ list.ListResourceSchemaRequest,
+	resp *list.ListResourceSchemaResponse,
+) {
+	resp.Schema = listschema.Schema{
+		MarkdownDescription: "List static routes in a site.",
+		Attributes: map[string]listschema.Attribute{
+			"site": listschema.StringAttribute{
+				MarkdownDescription: "The name of the site to list static routes from.",
+				Optional:            true,
+			},
+		},
+		Blocks: map[string]listschema.Block{
+			"filter": listschema.ListNestedBlock{
+				NestedObject: listschema.NestedBlockObject{
+					Attributes: map[string]listschema.Attribute{
+						"name": listschema.StringAttribute{
+							MarkdownDescription: "The name of the filter to apply. Supported values are: `name`, `type`. The `type` filter matches the static route type (`interface-route`, `nexthop-route`, `blackhole`).",
+							Required:            true,
+						},
+						"value": listschema.StringAttribute{
+							MarkdownDescription: "The value to filter by.",
+							Required:            true,
+						},
+					},
+				},
+			},
+		},
+	}
+}
+
+// List implements [list.ListResource].
+func (r *staticRouteFrameworkResource) List(
+	ctx context.Context,
+	req list.ListRequest,
+	stream *list.ListResultsStream,
+) {
+	var config staticRouteListConfigModel
+
+	diags := req.Config.Get(ctx, &config)
+	if diags.HasError() {
+		stream.Results = list.ListResultsStreamDiagnostics(diags)
+		return
 	}
 
-	if routing.GatewayType != "" {
-		model.GatewayType = types.StringValue(routing.GatewayType)
-	} else {
-		model.GatewayType = types.StringValue("default")
+	site := config.Site.ValueString()
+	if site == "" {
+		site = r.client.Site
+	}
+
+	// Process filter blocks.
+	var filters []staticRouteListFilterModel
+	if !config.Filter.IsNull() && !config.Filter.IsUnknown() {
+		config.Filter.ElementsAs(ctx, &filters, false)
+	}
+
+	postFilters := make(map[string]string)
+	for _, f := range filters {
+		postFilters[f.Name.ValueString()] = f.Value.ValueString()
+	}
+
+	routings, err := r.client.ListRouting(ctx, site)
+	if err != nil {
+		var d diag.Diagnostics
+		d.AddError("Error Listing Static Routes", "Could not list static routes: "+err.Error())
+		stream.Results = list.ListResultsStreamDiagnostics(d)
+		return
+	}
+
+	stream.Results = func(push func(list.ListResult) bool) {
+		for _, routing := range routings {
+			// Only surface static routes.
+			if routing.Type != "static-route" {
+				continue
+			}
+
+			// Apply name filter.
+			if val, ok := postFilters["name"]; ok {
+				if routing.Name != val {
+					continue
+				}
+			}
+
+			// Apply type filter (static route type).
+			if val, ok := postFilters["type"]; ok {
+				if routing.StaticRouteType != val {
+					continue
+				}
+			}
+
+			result := req.NewListResult(ctx)
+
+			// Display name: prefer name, fall back to ID.
+			if routing.Name != "" {
+				result.DisplayName = routing.Name
+			} else {
+				result.DisplayName = routing.ID
+			}
+
+			// Set identity.
+			result.Diagnostics.Append(
+				result.Identity.Set(ctx, staticRouteIdentityModel{
+					ID:   types.StringValue(routing.ID),
+					Site: types.StringValue(site),
+				})...,
+			)
+
+			// Convert to model.
+			var model staticRouteFrameworkResourceModel
+			routingCopy := routing
+			result.Diagnostics.Append(r.routingToModel(ctx, &routingCopy, &model, site)...)
+			if !result.Diagnostics.HasError() {
+				model.Timeouts = timeoutsNullValue()
+				result.Diagnostics.Append(result.Resource.Set(ctx, model)...)
+			}
+
+			if !push(result) {
+				return
+			}
+		}
 	}
 }

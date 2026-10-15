@@ -12,16 +12,116 @@ Manages an individual firewall rule on the gateway.
 ## Example Usage
 
 ```terraform
-resource "unifi_firewall_rule" "drop_all" {
-  name    = "drop all"
+# unifi_firewall_rule manages an individual firewall rule on the gateway.
+#
+# action  must be one of: drop, accept, reject.
+# ruleset is the rule chain, e.g. LAN_IN, WAN_IN, GUEST_IN, WANv6_IN, etc.
+# rule_index must fall in an interface-specific block:
+#   2000-2999 (LAN), 3000-3999 (WAN), 4000-4999 (GUEST),
+#   or the high-range equivalents 20000-29999 / 30000-39999 / 40000-49999.
+
+# Drop all traffic destined to the gateway from the LAN.
+resource "unifi_firewall_rule" "drop_to_gateway" {
+  name    = "drop to gateway"
   action  = "drop"
   ruleset = "LAN_IN"
 
   rule_index = 2011
+  protocol   = "all"
 
-  protocol = "all"
+  destination = {
+    address = "192.168.1.1"
+  }
+}
 
-  dst_address = "192.168.1.1"
+# Accept established/related return traffic on the WAN inbound chain.
+resource "unifi_firewall_rule" "wan_in_established" {
+  name    = "allow established/related"
+  action  = "accept"
+  ruleset = "WAN_IN"
+
+  rule_index = 3001
+  protocol   = "all"
+
+  state = {
+    established = true
+    related     = true
+  }
+}
+
+# Use firewall groups: allow the trusted admin hosts to reach the web ports.
+resource "unifi_firewall_group" "admin_hosts" {
+  name    = "admin-hosts"
+  type    = "address-group"
+  members = ["192.168.1.10", "192.168.1.11"]
+}
+
+resource "unifi_firewall_group" "web_ports" {
+  name    = "web-ports"
+  type    = "port-group"
+  members = ["80", "443"]
+}
+
+resource "unifi_firewall_rule" "allow_admin_web" {
+  name    = "allow admin to web"
+  action  = "accept"
+  ruleset = "LAN_IN"
+
+  rule_index = 2012
+  protocol   = "tcp"
+
+  source = {
+    firewall_group_ids = [unifi_firewall_group.admin_hosts.id]
+  }
+  destination = {
+    firewall_group_ids = [unifi_firewall_group.web_ports.id]
+  }
+}
+
+# Source/destination address and port with a single host source (ADDRv4).
+resource "unifi_firewall_rule" "allow_ssh_from_host" {
+  name    = "allow ssh from jump host"
+  action  = "accept"
+  ruleset = "LAN_IN"
+
+  rule_index = 2013
+  protocol   = "tcp"
+
+  source = {
+    address      = "192.168.1.5"
+    network_type = "ADDRv4"
+  }
+  destination = {
+    address = "192.168.20.0/24"
+    port    = "22"
+  }
+
+  logging = true
+}
+
+# Reject UDP traffic to a guest network with logging enabled.
+resource "unifi_firewall_rule" "reject_guest_udp" {
+  name    = "reject guest udp"
+  action  = "reject"
+  ruleset = "GUEST_IN"
+
+  rule_index = 4001
+  protocol   = "udp"
+
+  destination = {
+    port = "53"
+  }
+  logging = true
+}
+
+# IPv6 example on the WANv6 inbound chain, dropping all inbound IPv6.
+resource "unifi_firewall_rule" "drop_wan_v6" {
+  name    = "drop inbound ipv6"
+  action  = "drop"
+  ruleset = "WANv6_IN"
+
+  rule_index  = 3002
+  protocol_v6 = "all"
 }
 ```
 
@@ -37,15 +137,9 @@ resource "unifi_firewall_rule" "drop_all" {
 
 ### Optional
 
-- `dst_address` (String) The destination address of the firewall rule.
-- `dst_address_ipv6` (String) The IPv6 destination address of the firewall rule.
-- `dst_firewall_group_ids` (Set of String) The destination firewall group IDs of the firewall rule.
-- `dst_network_id` (String) The destination network ID of the firewall rule.
-- `dst_network_type` (String) The destination network type of the firewall rule. Can be one of `ADDRv4` or `NETv4`.
-- `dst_port` (String) The destination port of the firewall rule.
+- `destination` (Attributes) The destination match criteria of the firewall rule. (see [below for nested schema](#nestedatt--destination))
 - `enabled` (Boolean) Specifies whether the rule should be enabled.
-- `icmp_typename` (String) ICMP type name.
-- `icmp_v6_typename` (String) ICMPv6 type name.
+- `icmp` (Attributes) ICMP type matching for the firewall rule. (see [below for nested schema](#nestedatt--icmp))
 - `ip_sec` (String) Specify whether the rule matches on IPsec packets. Can be one of `match-ipset` or `match-none`.
 - `logging` (Boolean) Enable logging for the firewall rule.
 - `protocol` (String) The protocol of the rule.
@@ -53,27 +147,76 @@ resource "unifi_firewall_rule" "drop_all" {
 - `protocol_v6` (String) The IPv6 protocol of the rule.
 - `setting_preference` (String) Whether the rule is managed automatically by the controller or manually. Can be one of `auto` or `manual`.
 - `site` (String) The name of the site to associate the firewall rule with.
-- `src_address` (String) The source address for the firewall rule.
-- `src_address_ipv6` (String) The IPv6 source address for the firewall rule.
-- `src_firewall_group_ids` (Set of String) The source firewall group IDs for the firewall rule.
-- `src_mac` (String) The source MAC address of the firewall rule.
-- `src_network_id` (String) The source network ID for the firewall rule.
-- `src_network_type` (String) The source network type of the firewall rule. Can be one of `ADDRv4` or `NETv4`.
-- `src_port` (String) The source port of the firewall rule.
-- `state_established` (Boolean) Match where the state is established.
-- `state_invalid` (Boolean) Match where the state is invalid.
-- `state_new` (Boolean) Match where the state is new.
-- `state_related` (Boolean) Match where the state is related.
+- `source` (Attributes) The source match criteria of the firewall rule. (see [below for nested schema](#nestedatt--source))
+- `state` (Attributes) Connection state matching for the firewall rule. (see [below for nested schema](#nestedatt--state))
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 
 ### Read-Only
 
 - `id` (String) The ID of the firewall rule.
 
+<a id="nestedatt--destination"></a>
+### Nested Schema for `destination`
+
+Optional:
+
+- `address` (String) The destination address of the firewall rule.
+- `address_ipv6` (String) The IPv6 destination address of the firewall rule.
+- `firewall_group_ids` (Set of String) The destination firewall group IDs of the firewall rule.
+- `network_id` (String) The destination network ID of the firewall rule.
+- `network_type` (String) The destination network type of the firewall rule. Can be one of `ADDRv4` or `NETv4`.
+- `port` (String) The destination port of the firewall rule.
+
+
+<a id="nestedatt--icmp"></a>
+### Nested Schema for `icmp`
+
+Optional:
+
+- `typename` (String) ICMP type name.
+- `v6_typename` (String) ICMPv6 type name.
+
+
+<a id="nestedatt--source"></a>
+### Nested Schema for `source`
+
+Optional:
+
+- `address` (String) The source address for the firewall rule.
+- `address_ipv6` (String) The IPv6 source address for the firewall rule.
+- `firewall_group_ids` (Set of String) The source firewall group IDs for the firewall rule.
+- `mac` (String) The source MAC address of the firewall rule.
+- `network_id` (String) The source network ID for the firewall rule.
+- `network_type` (String) The source network type of the firewall rule. Can be one of `ADDRv4` or `NETv4`.
+- `port` (String) The source port of the firewall rule.
+
+
+<a id="nestedatt--state"></a>
+### Nested Schema for `state`
+
+Optional:
+
+- `established` (Boolean) Match where the state is established.
+- `invalid` (Boolean) Match where the state is invalid.
+- `new` (Boolean) Match where the state is new.
+- `related` (Boolean) Match where the state is related.
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+
 ## Import
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # import using the ID from the controller API/UI

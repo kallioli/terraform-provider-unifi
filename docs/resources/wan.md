@@ -12,35 +12,82 @@ WAN network resource
 ## Example Usage
 
 ```terraform
-resource "unifi_wan" "default" {
-  name         = "Internet 1"
-  type         = "dhcp"
-  type_v6      = "dhcpv6"
-  vlan_enabled = true
-  vlan         = 10
-  enabled      = true
+# Basic DHCP WAN on a tagged VLAN.
+resource "unifi_wan" "primary" {
+  name    = "Internet 1"
+  type    = "dhcp"   # one of: dhcp, static, pppoe, disabled
+  type_v6 = "dhcpv6" # IPv6 WAN type: dhcpv6, slaac, ...
+  enabled = true
 
-  dns_preference = "manual"
-  dns1           = "1.1.1.1"
-  dns2           = "1.0.0.1"
+  # WAN VLAN tagging.
+  vlan = {
+    enabled = true
+    id      = 10
+  }
 
-  smartq_enabled   = true
-  smartq_up_rate   = 500000
-  smartq_down_rate = 500000
+  # Manual upstream DNS instead of the ISP-provided servers.
+  dns = {
+    preference = "manual" # auto or manual
+    primary    = "1.1.1.1"
+    secondary  = "1.0.0.1"
+  }
+}
 
-  egress_qos_enabled = true
-  egress_qos         = 1
-  dhcp_cos           = 0
-  dhcpv6_cos         = 0
+# Fully-featured secondary WAN used as a weighted load-balance member, with
+# Smart Queues (SQM), QoS marking, IGMP proxy and advertised line capacity.
+resource "unifi_wan" "secondary" {
+  name    = "Internet 2"
+  type    = "dhcp"
+  enabled = true
 
+  vlan = {
+    enabled = true
+    id      = 20
+  }
+
+  # Smart Queue Management rates are in kbps.
+  smartq = {
+    enabled   = true
+    up_rate   = 500000
+    down_rate = 500000
+  }
+
+  # Egress QoS / 802.1p priority (0-7).
+  egress_qos = {
+    enabled  = true
+    priority = 1
+  }
+
+  # Participate in WAN load balancing. type: failover-only | weighted.
+  load_balance = {
+    type              = "weighted"
+    weight            = 75 # 1-100
+    failover_priority = 2  # 1-10
+  }
+
+  # Multicast/IGMP proxy: downstream is none | lan | guest.
+  igmp_proxy = {
+    downstream = "lan"
+    upstream   = true
+  }
+
+  # Advertise the line's real capacity to the controller (kbps).
   provider_capabilities = {
     download_kilobits_per_second = 1000000
     upload_kilobits_per_second   = 100000
   }
+}
 
-  load_balance_type   = "weighted"
-  load_balance_weight = 75
-  failover_priority   = 2
+# A PPPoE uplink. The credentials are only written when set, so an imported
+# PPPoE WAN can be managed for its other settings without touching the ISP
+# login. Prefer password_wo: it never lands in state, at the cost of the
+# provider being unable to detect a password changed outside Terraform.
+resource "unifi_wan" "pppoe" {
+  name = "Internet (PPPoE)"
+  type = "pppoe"
+
+  username    = var.isp_username
+  password_wo = var.isp_password
 }
 ```
 
@@ -53,9 +100,12 @@ resource "unifi_wan" "default" {
 
 ### Optional
 
+> **NOTE**: [Write-only arguments](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments) are supported in Terraform 1.11 and later.
+
 - `dhcp` (Attributes) DHCP configuration (see [below for nested schema](#nestedatt--dhcp))
 - `dhcpv6` (Attributes) DHCPv6 configuration (see [below for nested schema](#nestedatt--dhcpv6))
 - `dns` (Attributes) DNS configuration (see [below for nested schema](#nestedatt--dns))
+- `dslite` (Attributes) DS-Lite (AFTR) configuration. (see [below for nested schema](#nestedatt--dslite))
 - `egress_qos` (Attributes) Egress QoS configuration (see [below for nested schema](#nestedatt--egress_qos))
 - `enabled` (Boolean) Whether the WAN network is enabled
 - `igmp_proxy` (Attributes) IGMP proxy configuration (see [below for nested schema](#nestedatt--igmp_proxy))
@@ -63,18 +113,21 @@ resource "unifi_wan" "default" {
 - `ipv6_setting_preference` (String) Whether WAN IPv6 settings are managed automatically by the controller or manually. Can be one of `auto` or `manual`.
 - `load_balance` (Attributes) Load balance configuration (see [below for nested schema](#nestedatt--load_balance))
 - `mac_override_enabled` (Boolean) Whether the WAN interface MAC address is overridden.
-- `provider_capabilities` (Attributes) WAN provider capabilities (see [below for nested schema](#nestedatt--provider_capabilities))
+- `networkgroup` (String) The WAN network group this interface belongs to (`WAN`, `WAN2`, …). The primary uplink is `WAN`; a secondary/SFP uplink is `WAN2`. Computed from the controller when unset (so an imported `WAN2` is preserved), defaulting to `WAN` on create. Required to manage multi-WAN (WAN2+) setups, where a hard-coded `WAN` collides with the primary (`api.err.WanConfigurationForNetworkGroupAlreadyExists`).
+- `password` (String, Sensitive) PPPoE password supplied by the ISP. Stored in state - use `password_wo` to avoid persisting the secret. Only meaningful when `type` is `pppoe`.
+- `password_wo` (String, Sensitive, [Write-only](https://developer.hashicorp.com/terraform/language/resources/ephemeral#write-only-arguments)) Write-only equivalent of `password` (Terraform 1.11+). Used at apply time but never written to state, so it can be sourced from an ephemeral resource. Because nothing is stored, the provider cannot detect a password changed outside Terraform: such a change produces no diff. Mutually exclusive with `password`.
+- `provider_capabilities` (Attributes) WAN provider capabilities (line rate). Detected/populated by the controller; preserved when not set in config. (see [below for nested schema](#nestedatt--provider_capabilities))
 - `report_wan_event` (Boolean) Whether to report WAN events
 - `setting_preference` (String) Whether WAN settings are managed automatically by the controller or manually. Can be one of `auto` or `manual`.
 - `single_network_lan` (String) The LAN network used for IPv6 single-network prefix delegation (used when the IPv6 delegation type is `single_network`).
 - `site` (String) The name of the site to associate the WAN network with
 - `smartq` (Attributes) Smart Queue configuration (see [below for nested schema](#nestedatt--smartq))
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 - `type` (String) The WAN type (dhcp, static, pppoe)
-- `type_v6` (String) The IPv6 WAN type (dhcpv6, static, disabled)
+- `type_v6` (String) The IPv6 WAN type. One of `dhcpv6`, `slaac`, `static`, or `disabled`. Note: the controller requires `slaac` when the IPv6 delegation type is `single_network` (`api.err.SingleNetworkMustBeSLAAC` otherwise) — common with ISPs that deliver IPv6 by Router Advertisement, e.g. Free/Freebox in bridge mode.
 - `upnp` (Attributes) UPnP configuration (see [below for nested schema](#nestedatt--upnp))
+- `username` (String) PPPoE username supplied by the ISP. Only meaningful when `type` is `pppoe`. Left unset, the attribute is not written and whatever the controller holds is preserved, so an imported PPPoE uplink can be managed without touching its login.
 - `vlan` (Attributes) VLAN configuration (see [below for nested schema](#nestedatt--vlan))
-- `wan_dslite_remote_host` (String) The DS-Lite AFTR remote host. Only used when `wan_dslite_remote_host_auto` is disabled.
-- `wan_dslite_remote_host_auto` (Boolean) Whether the DS-Lite AFTR remote host is detected automatically.
 
 ### Read-Only
 
@@ -105,8 +158,7 @@ Optional:
 
 - `cos` (Number) DHCPv6 Class of Service
 - `options` (Attributes List) DHCPv6 options (see [below for nested schema](#nestedatt--dhcpv6--options))
-- `pd_size` (Number) DHCPv6 prefix delegation size
-- `pd_size_auto` (Boolean) Whether DHCPv6 PD size is automatic
+- `pd` (Attributes) DHCPv6 prefix delegation configuration (see [below for nested schema](#nestedatt--dhcpv6--pd))
 - `wan_delegation_type` (String) IPv6 WAN delegation type (pd, single_network, none)
 
 <a id="nestedatt--dhcpv6--options"></a>
@@ -118,18 +170,44 @@ Required:
 - `value` (String) DHCPv6 option value
 
 
+<a id="nestedatt--dhcpv6--pd"></a>
+### Nested Schema for `dhcpv6.pd`
+
+Optional:
+
+- `size` (Number) DHCPv6 prefix delegation size
+- `size_auto` (Boolean) Whether DHCPv6 PD size is automatic
+
+
 
 <a id="nestedatt--dns"></a>
 ### Nested Schema for `dns`
 
 Optional:
 
-- `ipv6_preference` (String) IPv6 DNS preference (auto, manual)
-- `ipv6_primary` (String) Primary IPv6 DNS server
-- `ipv6_secondary` (String) Secondary IPv6 DNS server
+- `ipv6` (Attributes) IPv6 DNS configuration (see [below for nested schema](#nestedatt--dns--ipv6))
 - `preference` (String) DNS preference (auto, manual)
 - `primary` (String) Primary DNS server
 - `secondary` (String) Secondary DNS server
+
+<a id="nestedatt--dns--ipv6"></a>
+### Nested Schema for `dns.ipv6`
+
+Optional:
+
+- `preference` (String) IPv6 DNS preference (auto, manual)
+- `primary` (String) Primary IPv6 DNS server
+- `secondary` (String) Secondary IPv6 DNS server
+
+
+
+<a id="nestedatt--dslite"></a>
+### Nested Schema for `dslite`
+
+Optional:
+
+- `remote_host` (String) The DS-Lite AFTR remote host. Only used when `remote_host_auto` is disabled.
+- `remote_host_auto` (Boolean) Whether the DS-Lite AFTR remote host is detected automatically.
 
 
 <a id="nestedatt--egress_qos"></a>
@@ -163,7 +241,7 @@ Optional:
 <a id="nestedatt--provider_capabilities"></a>
 ### Nested Schema for `provider_capabilities`
 
-Required:
+Optional:
 
 - `download_kilobits_per_second` (Number) Download speed in kilobits per second
 - `upload_kilobits_per_second` (Number) Upload speed in kilobits per second
@@ -177,6 +255,17 @@ Optional:
 - `down_rate` (Number) Smart Queue download rate in kbps
 - `enabled` (Boolean) Whether Smart Queue is enabled
 - `up_rate` (Number) Smart Queue upload rate in kbps
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
 
 
 <a id="nestedatt--upnp"></a>
@@ -202,7 +291,7 @@ Optional:
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # import from provider configured site

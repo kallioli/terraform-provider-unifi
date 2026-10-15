@@ -1,11 +1,89 @@
 package unifi
 
 import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"math/big"
 	"os"
 	"testing"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timetypes/timetypes"
+	"github.com/hashicorp/terraform-plugin-framework/attr"
+	"github.com/hashicorp/terraform-plugin-framework/diag"
+	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema"
+	"github.com/hashicorp/terraform-plugin-framework/resource/schema/planmodifier"
+	"github.com/hashicorp/terraform-plugin-framework/tfsdk"
+	"github.com/hashicorp/terraform-plugin-framework/types"
+	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
+	"github.com/hashicorp/terraform-plugin-testing/terraform"
+	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/go-unifi/unifi/settings"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 )
+
+// testAccSettingProbeClient builds a raw API client for capability probes,
+// skipping the test when the controller cannot be reached.
+func testAccSettingProbeClient(t *testing.T, ctx context.Context) *unifi.ApiClient {
+	t.Helper()
+	client, err := unifi.New(ctx, &unifi.Config{
+		BaseURL:       os.Getenv("UNIFI_API"),
+		Username:      os.Getenv("UNIFI_USERNAME"),
+		Password:      os.Getenv("UNIFI_PASSWORD"),
+		AllowInsecure: true,
+	})
+	if err != nil {
+		t.Skipf("cannot probe controller capabilities: %s", err)
+	}
+	return client
+}
+
+// testAccSettingDohCustomServersPreCheck skips when the controller rejects
+// custom DoH servers (app.err.DohCustomServersUnsupported on simulation
+// controllers). The probe applies a custom-server config and restores the
+// original setting when it succeeds.
+func testAccSettingDohCustomServersPreCheck(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	client := testAccSettingProbeClient(t, ctx)
+	_, current, err := unifi.GetSetting[*settings.Doh](client, ctx, "default")
+	if err != nil {
+		t.Skipf("cannot read DoH setting to probe custom-server support: %s", err)
+	}
+	probe := *current
+	probe.State = "custom"
+	probe.CustomServers = []settings.SettingDohCustomServers{
+		{ServerName: "tfacc-doh-probe", Enabled: true},
+	}
+	if err := client.UpdateSetting(ctx, "default", &probe); err != nil {
+		t.Skipf("custom DoH servers not supported by this controller: %s", err)
+	}
+	if err := client.UpdateSetting(ctx, "default", current); err != nil {
+		t.Fatalf("restoring DoH setting after probe: %s", err)
+	}
+}
+
+// testAccSettingIpsHoneypotPreCheck skips when the site's gateway is
+// USG-class: the controller rejects honeypot config with
+// api.err.HoneypotIsNotSupportedInUsg (the simulated gateway is a UGW3).
+func testAccSettingIpsHoneypotPreCheck(t *testing.T) {
+	t.Helper()
+	ctx := context.Background()
+	client := testAccSettingProbeClient(t, ctx)
+	devices, err := client.ListDevice(ctx, "default")
+	if err != nil {
+		t.Skipf("cannot probe gateway model for honeypot support: %s", err)
+	}
+	for _, d := range devices {
+		if d.Type == "ugw" {
+			t.Skip("IPS honeypot is not supported on USG-class gateways")
+		}
+	}
+}
 
 func TestAccSettingResource_mgmt(t *testing.T) {
 	resource.Test(t, resource.TestCase{
@@ -17,12 +95,12 @@ func TestAccSettingResource_mgmt(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.auto_upgrade",
+						"mgmt.auto_upgrade.enabled",
 						"true",
 					),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_enabled",
+						"mgmt.ssh.enabled",
 						"false",
 					),
 				),
@@ -33,8 +111,10 @@ func TestAccSettingResource_mgmt(t *testing.T) {
 				ImportStateVerify: true,
 				ImportStateVerifyIgnore: []string{
 					"mgmt.%",
-					"mgmt.auto_upgrade",
-					"mgmt.ssh_enabled",
+					"mgmt.auto_upgrade.%",
+					"mgmt.auto_upgrade.enabled",
+					"mgmt.ssh.%",
+					"mgmt.ssh.enabled",
 				},
 			},
 		},
@@ -111,6 +191,305 @@ func TestAccSettingResource_usg(t *testing.T) {
 	})
 }
 
+// TestAccSettingResource_usgGeo guards #374: the Region Blocking fields must
+// round-trip and the follow-up refresh plan must stay empty. On controllers
+// that store the config as the flat usg geo_ip_filtering_* fields the legacy path is used;
+// controllers that store it under usg_geo.ip_filtering take the standalone
+// write/read path.
+func TestAccSettingResource_usgGeo(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccSettingConfig_usgGeo(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "usg.geo_ip_filtering.enabled", "true",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "usg.geo_ip_filtering.block", "block",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "usg.geo_ip_filtering.countries", "KP,RU",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "usg.geo_ip_filtering.traffic_direction", "both",
+					),
+				),
+			},
+			{
+				Config: testAccSettingConfig_usgGeoUpdated(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "usg.geo_ip_filtering.countries", "CN,KP,RU",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "usg.geo_ip_filtering.traffic_direction", "ingress",
+					),
+				),
+			},
+			{
+				Config: testAccSettingConfig_usgGeoDisabled(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "usg.geo_ip_filtering.enabled", "false",
+					),
+				),
+			},
+		},
+	})
+}
+
+func testAccSettingConfig_usgGeo() string {
+	return `
+resource "unifi_setting" "test" {
+  usg = {
+    geo_ip_filtering = {
+      enabled           = true
+      block             = "block"
+      countries         = "KP,RU"
+      traffic_direction = "both"
+    }
+  }
+}
+`
+}
+
+func testAccSettingConfig_usgGeoUpdated() string {
+	return `
+resource "unifi_setting" "test" {
+  usg = {
+    geo_ip_filtering = {
+      enabled           = true
+      block             = "block"
+      countries         = "CN,KP,RU"
+      traffic_direction = "ingress"
+    }
+  }
+}
+`
+}
+
+func testAccSettingConfig_usgGeoDisabled() string {
+	return `
+resource "unifi_setting" "test" {
+  usg = {
+    geo_ip_filtering = {
+      enabled           = false
+      block             = "block"
+      countries         = "CN,KP,RU"
+      traffic_direction = "ingress"
+    }
+  }
+}
+`
+}
+
+// TestAccSettingResource_globalSwitch guards the partial-write contract of the
+// global_switch block: fields the provider does not model must survive an
+// apply, and fields omitted from a later config must keep their prior values
+// without drift. The post-apply empty-plan check of each step covers drift.
+func TestAccSettingResource_globalSwitch(t *testing.T) {
+	ctx := context.Background()
+	var client *unifi.ApiClient
+	site := os.Getenv("UNIFI_SITE")
+	if site == "" {
+		site = "default"
+	}
+
+	resource.Test(t, resource.TestCase{
+		PreCheck: func() {
+			preCheck(t)
+			client = testAccSettingProbeClient(t, ctx)
+			original, found := testAccGlobalSwitchRaw(t, ctx, client, site)
+			if !found {
+				t.Skip("controller has no global_switch setting")
+			}
+			t.Cleanup(func() {
+				restore := &settings.RawSetting{
+					BaseSetting: settings.BaseSetting{Key: globalSwitchSettingKey},
+					Data:        original,
+				}
+				if err := client.UpdateSetting(ctx, site, restore); err != nil {
+					t.Errorf("restoring global_switch setting: %s", err)
+				}
+			})
+			// flood_known_protocols is not exposed by the block, so it must
+			// never be touched by the provider.
+			seed := &settings.RawSetting{
+				BaseSetting: settings.BaseSetting{Key: globalSwitchSettingKey},
+				Data:        map[string]any{"flood_known_protocols": true},
+			}
+			if err := client.UpdateSetting(ctx, site, seed); err != nil {
+				t.Fatalf("seeding global_switch setting: %s", err)
+			}
+		},
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: `
+resource "unifi_setting" "test" {
+  global_switch = {
+    stp_version            = "stp"
+    dhcp_snoop             = true
+    jumboframe_enabled     = true
+    dot1x_portctrl_enabled = false
+  }
+}
+`,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"global_switch.stp_version",
+						"stp",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"global_switch.dhcp_snoop",
+						"true",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"global_switch.jumboframe_enabled",
+						"true",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"global_switch.dot1x_portctrl_enabled",
+						"false",
+					),
+					testAccCheckGlobalSwitchRaw(t, ctx, &client, site, map[string]any{
+						"stp_version":           "stp",
+						"jumboframe_enabled":    true,
+						"flood_known_protocols": true,
+					}),
+				),
+			},
+			{
+				Config: `
+resource "unifi_setting" "test" {
+  global_switch = {
+    jumboframe_enabled = false
+  }
+}
+`,
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"global_switch.jumboframe_enabled",
+						"false",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"global_switch.stp_version",
+						"stp",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"global_switch.dhcp_snoop",
+						"true",
+					),
+					testAccCheckGlobalSwitchRaw(t, ctx, &client, site, map[string]any{
+						"stp_version":           "stp",
+						"dhcp_snoop":            true,
+						"jumboframe_enabled":    false,
+						"flood_known_protocols": true,
+					}),
+				),
+			},
+		},
+	})
+}
+
+func testAccGlobalSwitchRaw(
+	t *testing.T,
+	ctx context.Context,
+	client *unifi.ApiClient,
+	site string,
+) (map[string]any, bool) {
+	t.Helper()
+	all, err := client.ListSettings(ctx, site)
+	if err != nil {
+		t.Fatalf("listing settings: %s", err)
+	}
+	for _, s := range all {
+		if s.Key == globalSwitchSettingKey {
+			return s.Data, true
+		}
+	}
+	return nil, false
+}
+
+func testAccCheckGlobalSwitchRaw(
+	t *testing.T,
+	ctx context.Context,
+	client **unifi.ApiClient,
+	site string,
+	want map[string]any,
+) resource.TestCheckFunc {
+	return func(*terraform.State) error {
+		got, found := testAccGlobalSwitchRaw(t, ctx, *client, site)
+		if !found {
+			return fmt.Errorf("global_switch setting not found on controller")
+		}
+		for k, v := range want {
+			if got[k] != v {
+				return fmt.Errorf("controller global_switch.%s = %v, want %v", k, got[k], v)
+			}
+		}
+		return nil
+	}
+}
+
+// TestAccSettingResource_import exercises both import paths: the classic
+// string import (the import id is the site name, with state verification) and
+// the Terraform 1.12+ identity-based import block.
+//
+// The config intentionally manages no setting sections: readSettings only
+// refreshes sections already present in state, so a freshly imported setting
+// has every section null and any configured section would make the
+// post-import plan non-empty (the same reason the string-import tests above
+// need ImportStateVerifyIgnore for their section attributes).
+func TestAccSettingResource_import(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccSettingConfig_import(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr("unifi_setting.test_import", "id", "default"),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test_import",
+						"site",
+						"default",
+					),
+				),
+			},
+			// Classic string import (the import id is the site name).
+			{
+				ResourceName:      "unifi_setting.test_import",
+				ImportState:       true,
+				ImportStateVerify: true,
+			},
+			// Identity-based import (import block with identity, Terraform 1.12+).
+			{
+				ResourceName:    "unifi_setting.test_import",
+				ImportState:     true,
+				ImportStateKind: resource.ImportBlockWithResourceIdentity,
+			},
+		},
+	})
+}
+
+func testAccSettingConfig_import() string {
+	return `
+resource "unifi_setting" "test_import" {
+}
+`
+}
+
 func TestAccSettingResource_combined(t *testing.T) {
 	resource.Test(t, resource.TestCase{
 		PreCheck:                 func() { preCheck(t) },
@@ -121,12 +500,12 @@ func TestAccSettingResource_combined(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.auto_upgrade",
+						"mgmt.auto_upgrade.enabled",
 						"true",
 					),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_enabled",
+						"mgmt.ssh.enabled",
 						"true",
 					),
 					resource.TestCheckResourceAttr(
@@ -146,12 +525,12 @@ func TestAccSettingResource_combined(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.auto_upgrade",
+						"mgmt.auto_upgrade.enabled",
 						"false",
 					),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_enabled",
+						"mgmt.ssh.enabled",
 						"false",
 					),
 					resource.TestCheckResourceAttr(
@@ -180,23 +559,23 @@ func TestAccSettingResource_sshKeys(t *testing.T) {
 				Check: resource.ComposeTestCheckFunc(
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_enabled",
+						"mgmt.ssh.enabled",
 						"true",
 					),
-					resource.TestCheckResourceAttr("unifi_setting.test", "mgmt.ssh_keys.#", "1"),
+					resource.TestCheckResourceAttr("unifi_setting.test", "mgmt.ssh.keys.#", "1"),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_keys.0.name",
+						"mgmt.ssh.keys.0.name",
 						"test-key",
 					),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_keys.0.type",
+						"mgmt.ssh.keys.0.type",
 						"ssh-rsa",
 					),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_keys.0.comment",
+						"mgmt.ssh.keys.0.comment",
 						"Test SSH Key",
 					),
 				),
@@ -204,15 +583,15 @@ func TestAccSettingResource_sshKeys(t *testing.T) {
 			{
 				Config: testAccSettingConfig_sshKeysUpdate(),
 				Check: resource.ComposeTestCheckFunc(
-					resource.TestCheckResourceAttr("unifi_setting.test", "mgmt.ssh_keys.#", "2"),
+					resource.TestCheckResourceAttr("unifi_setting.test", "mgmt.ssh.keys.#", "2"),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_keys.0.name",
+						"mgmt.ssh.keys.0.name",
 						"test-key",
 					),
 					resource.TestCheckResourceAttr(
 						"unifi_setting.test",
-						"mgmt.ssh_keys.1.name",
+						"mgmt.ssh.keys.1.name",
 						"test-key-2",
 					),
 				),
@@ -225,8 +604,8 @@ func testAccSettingConfig_mgmt() string {
 	return `
 resource "unifi_setting" "test" {
   mgmt = {
-    auto_upgrade = true
-    ssh_enabled  = false
+    auto_upgrade = { enabled = true }
+    ssh          = { enabled = false }
   }
 }
 `
@@ -259,8 +638,8 @@ func testAccSettingConfig_combined() string {
 	return `
 resource "unifi_setting" "test" {
   mgmt = {
-    auto_upgrade = true
-    ssh_enabled  = true
+    auto_upgrade = { enabled = true }
+    ssh          = { enabled = true }
   }
 
   radius = {
@@ -278,8 +657,8 @@ func testAccSettingConfig_combinedUpdate() string {
 	return `
 resource "unifi_setting" "test" {
   mgmt = {
-    auto_upgrade = false
-    ssh_enabled  = false
+    auto_upgrade = { enabled = false }
+    ssh          = { enabled = false }
   }
 
   radius = {
@@ -297,13 +676,15 @@ func testAccSettingConfig_sshKeys() string {
 	return `
 resource "unifi_setting" "test" {
   mgmt = {
-    ssh_enabled = true
-    ssh_keys = [{
-      name    = "test-key"
-      type    = "ssh-rsa"
-      key     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDTest123"
-      comment = "Test SSH Key"
-    }]
+    ssh = {
+      enabled = true
+      keys = [{
+        name    = "test-key"
+        type    = "ssh-rsa"
+        key     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDTest123"
+        comment = "Test SSH Key"
+      }]
+    }
   }
 }
 `
@@ -348,16 +729,14 @@ func TestAccSettingResource_doh(t *testing.T) {
 }
 
 func TestAccSettingResource_dohCustomServers(t *testing.T) {
-	// custom_servers requires controller support beyond simulation/demo mode;
-	// the simulation controller returns DohCustomServersUnsupported (400).
-	// Run only against a real controller (UNIFI_SKIP_CONTAINER bypasses the
-	// docker simulation and targets the pre-set UNIFI_* endpoint).
-	if os.Getenv("UNIFI_SKIP_CONTAINER") == "" {
-		t.Skip("custom DoH servers require a real controller; set UNIFI_SKIP_CONTAINER to run")
-	}
-
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { preCheck(t) },
+		PreCheck: func() {
+			preCheck(t)
+			// Simulation controllers reject custom_servers with
+			// DohCustomServersUnsupported (400); probe instead of inferring
+			// from the environment.
+			testAccSettingDohCustomServersPreCheck(t)
+		},
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
@@ -455,16 +834,14 @@ func TestAccSettingResource_ips(t *testing.T) {
 }
 
 func TestAccSettingResource_ipsHoneypot(t *testing.T) {
-	// Honeypot requires a UDM-class gateway; the simulation controller presents as a USG,
-	// which returns HoneypotIsNotSupportedInUsg (400).
-	// honeypot is not supported on USG-class/simulation controllers; it
-	// requires a UDM-class device. Run only against a real controller.
-	if os.Getenv("UNIFI_SKIP_CONTAINER") == "" {
-		t.Skip("honeypot requires a real UDM-class controller; set UNIFI_SKIP_CONTAINER to run")
-	}
-
 	resource.Test(t, resource.TestCase{
-		PreCheck:                 func() { preCheck(t) },
+		PreCheck: func() {
+			preCheck(t)
+			// Honeypot requires a UDM-class gateway; sites with a USG-class
+			// gateway (including the simulated UGW3 once adopted) reject it
+			// with HoneypotIsNotSupportedInUsg (400).
+			testAccSettingIpsHoneypotPreCheck(t)
+		},
 		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
 		Steps: []resource.TestStep{
 			{
@@ -494,6 +871,158 @@ func TestAccSettingResource_ipsHoneypot(t *testing.T) {
 			},
 		},
 	})
+}
+
+// TestAccSettingResource_ipsSuppression guards #381: suppression entries must
+// round-trip and the follow-up plan must be empty (the framework fails a step
+// whose post-apply refresh plan is non-empty, which is exactly the perpetual
+// diff reported). On controllers that nest suppression in the ips setting the
+// nested path is used; controllers that store it under the standalone
+// ips_suppression key take the fallback write/read path. Controllers that
+// nest suppression (Network 10.0.x) only accept a non-empty list when at
+// least one network is IPS-enabled, so the configs attach one.
+func TestAccSettingResource_ipsSuppression(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccSettingConfig_ipsSuppression(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.alerts.#", "1",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test",
+						"ips.suppression.alerts.0.signature",
+						"ET SCAN Potential SSH Scan OUTBOUND",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.alerts.0.id", "2003068",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.whitelist.#", "1",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.whitelist.0.value", "10.0.0.5",
+					),
+				),
+			},
+			{
+				Config: testAccSettingConfig_ipsSuppressionUpdated(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.alerts.#", "2",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.whitelist.#", "0",
+					),
+				),
+			},
+			{
+				Config: testAccSettingConfig_ipsSuppressionCleared(),
+				Check: resource.ComposeTestCheckFunc(
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.alerts.#", "0",
+					),
+					resource.TestCheckResourceAttr(
+						"unifi_setting.test", "ips.suppression.whitelist.#", "0",
+					),
+				),
+			},
+		},
+	})
+}
+
+func testAccSettingConfig_ipsSuppression() string {
+	return `
+resource "unifi_network" "ips_suppression" {
+  name   = "test-ips-suppression"
+  subnet = "10.1.81.1/24"
+  vlan   = 81
+}
+
+resource "unifi_setting" "test" {
+  ips = {
+    ips_mode         = "disabled"
+    enabled_networks = [unifi_network.ips_suppression.id]
+    suppression = {
+      alerts = [{
+        category  = "emerging-scan"
+        gid       = 1
+        id        = 2003068
+        signature = "ET SCAN Potential SSH Scan OUTBOUND"
+        type      = "all"
+        tracking  = []
+      }]
+      whitelist = [{
+        direction = "both"
+        mode      = "ip"
+        value     = "10.0.0.5"
+      }]
+    }
+  }
+}
+`
+}
+
+func testAccSettingConfig_ipsSuppressionUpdated() string {
+	return `
+resource "unifi_network" "ips_suppression" {
+  name   = "test-ips-suppression"
+  subnet = "10.1.81.1/24"
+  vlan   = 81
+}
+
+resource "unifi_setting" "test" {
+  ips = {
+    ips_mode         = "disabled"
+    enabled_networks = [unifi_network.ips_suppression.id]
+    suppression = {
+      alerts = [
+        {
+          category  = "emerging-scan"
+          gid       = 1
+          id        = 2003068
+          signature = "ET SCAN Potential SSH Scan OUTBOUND"
+          type      = "all"
+          tracking  = []
+        },
+        {
+          category  = "emerging-dos"
+          gid       = 1
+          id        = 2019010
+          signature = "ET DOS Possible NTP DDoS"
+          type      = "all"
+          tracking  = []
+        },
+      ]
+      whitelist = []
+    }
+  }
+}
+`
+}
+
+func testAccSettingConfig_ipsSuppressionCleared() string {
+	return `
+resource "unifi_network" "ips_suppression" {
+  name   = "test-ips-suppression"
+  subnet = "10.1.81.1/24"
+  vlan   = 81
+}
+
+resource "unifi_setting" "test" {
+  ips = {
+    ips_mode         = "disabled"
+    enabled_networks = [unifi_network.ips_suppression.id]
+    suppression = {
+      alerts    = []
+      whitelist = []
+    }
+  }
+}
+`
 }
 
 func testAccSettingConfig_dohAuto() string {
@@ -578,22 +1107,2310 @@ func testAccSettingConfig_sshKeysUpdate() string {
 	return `
 resource "unifi_setting" "test" {
   mgmt = {
-    ssh_enabled = true
-    ssh_keys = [
-      {
-        name    = "test-key"
-        type    = "ssh-rsa"
-        key     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDTest123"
-        comment = "Test SSH Key"
-      },
-      {
-        name    = "test-key-2"
-        type    = "ssh-ed25519"
-        key     = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest456"
-        comment = "Second Test Key"
-      }
-    ]
+    ssh = {
+      enabled = true
+      keys = [
+        {
+          name    = "test-key"
+          type    = "ssh-rsa"
+          key     = "ssh-rsa AAAAB3NzaC1yc2EAAAADAQABAAABAQDTest123"
+          comment = "Test SSH Key"
+        },
+        {
+          name    = "test-key-2"
+          type    = "ssh-ed25519"
+          key     = "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITest456"
+          comment = "Second Test Key"
+        }
+      ]
+    }
   }
 }
 `
+}
+
+func TestNewSettingResource(t *testing.T) {
+	r := NewSettingResource()
+	if r == nil {
+		t.Fatal("NewSettingResource() returned nil")
+	}
+	if _, ok := r.(fwresource.ResourceWithConfigure); !ok {
+		t.Error("expected ResourceWithConfigure interface")
+	}
+	if _, ok := r.(fwresource.ResourceWithImportState); !ok {
+		t.Error("expected ResourceWithImportState interface")
+	}
+}
+
+func Test_settingResource_Metadata(t *testing.T) {
+	tests := []struct {
+		providerTypeName, wantTypeName string
+	}{
+		{"unifi", "unifi_setting"},
+		{"test", "test_setting"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.providerTypeName, func(t *testing.T) {
+			r := &settingResource{}
+			resp := &fwresource.MetadataResponse{}
+			r.Metadata(
+				context.Background(),
+				fwresource.MetadataRequest{ProviderTypeName: tt.providerTypeName},
+				resp,
+			)
+			if resp.TypeName != tt.wantTypeName {
+				t.Errorf("TypeName = %q, want %q", resp.TypeName, tt.wantTypeName)
+			}
+		})
+	}
+}
+
+func Test_settingResource_Schema(t *testing.T) {
+	r := &settingResource{}
+	resp := &fwresource.SchemaResponse{}
+	r.Schema(context.Background(), fwresource.SchemaRequest{}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Errorf("Schema() produced errors: %v", resp.Diagnostics)
+	}
+	for _, attr := range []string{"id", "site", "mgmt", "radius", "usg", "igmp_snooping", "global_switch", "doh", "ips"} {
+		if _, ok := resp.Schema.Attributes[attr]; !ok {
+			t.Errorf("missing attribute %q", attr)
+		}
+	}
+}
+
+// TestSettingNtpServersUseStateForUnknown guards #382: omitted
+// Optional+Computed server fields must retain their prior values instead of
+// repeatedly planning as "known after apply" when the NTP block is configured.
+func TestSettingNtpServersUseStateForUnknown(t *testing.T) {
+	resp := &fwresource.SchemaResponse{}
+	(&settingResource{}).Schema(context.Background(), fwresource.SchemaRequest{}, resp)
+
+	ntp, ok := resp.Schema.Attributes["ntp"].(schema.SingleNestedAttribute)
+	if !ok {
+		t.Fatal("ntp is not a SingleNestedAttribute")
+	}
+	for _, key := range []string{"ntp_server_1", "ntp_server_2", "ntp_server_3", "ntp_server_4"} {
+		server, ok := ntp.Attributes[key].(schema.StringAttribute)
+		if !ok {
+			t.Errorf("ntp.%s is not a StringAttribute", key)
+			continue
+		}
+		if !server.Optional || !server.Computed {
+			t.Errorf("ntp.%s must remain Optional+Computed", key)
+		}
+		if len(server.PlanModifiers) == 0 {
+			t.Errorf("ntp.%s must use UseStateForUnknown (#382)", key)
+			continue
+		}
+
+		req := planmodifier.StringRequest{
+			ConfigValue: types.StringNull(),
+			PlanValue:   types.StringUnknown(),
+			State: tfsdk.State{
+				Raw: tftypes.NewValue(tftypes.String, ""),
+			},
+			StateValue: types.StringValue(""),
+		}
+		modified := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+		server.PlanModifiers[0].PlanModifyString(context.Background(), req, modified)
+		if modified.Diagnostics.HasError() {
+			t.Errorf("ntp.%s plan modifier returned errors: %v", key, modified.Diagnostics)
+		}
+		if modified.PlanValue.IsNull() || modified.PlanValue.IsUnknown() ||
+			modified.PlanValue.ValueString() != "" {
+			t.Errorf("ntp.%s plan = %v, want prior known empty state", key, modified.PlanValue)
+		}
+	}
+}
+
+func Test_settingResource_UpgradeState(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+	got := r.UpgradeState(ctx)
+	if got == nil {
+		t.Fatal("UpgradeState() returned nil")
+	}
+	if _, ok := got[0]; !ok {
+		t.Error("UpgradeState() map should contain version key 0")
+	}
+}
+
+func Test_settingResource_Configure(t *testing.T) {
+	tests := []struct {
+		name      string
+		data      any
+		wantError bool
+	}{
+		{"nil", nil, false},
+		{"wrong type", "wrong", true},
+		{"correct client", &Client{Site: "default"}, false},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			r := &settingResource{}
+			resp := &fwresource.ConfigureResponse{}
+			r.Configure(
+				context.Background(),
+				fwresource.ConfigureRequest{ProviderData: tt.data},
+				resp,
+			)
+			if tt.wantError && !resp.Diagnostics.HasError() {
+				t.Error("expected error")
+			}
+			if !tt.wantError && resp.Diagnostics.HasError() {
+				t.Errorf("unexpected error: %v", resp.Diagnostics)
+			}
+		})
+	}
+}
+
+func Test_settingResource_ImportState(t *testing.T) {
+	t.Skip(
+		"ImportState delegates to ImportStatePassthroughID which requires full state schema setup",
+	)
+}
+
+func Test_settingResource_mgmtModelToSetting(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null groups produce empty setting", func(t *testing.T) {
+		// mgmtModelToSetting does not accept nil (it dereferences the pointer);
+		// null nested groups must leave the zero-value settings.Mgmt untouched.
+		model := &settingMgmtModel{
+			AutoUpgrade: types.ObjectNull(mgmtAutoUpgradeAttrTypes),
+			SSH:         types.ObjectNull(mgmtSSHAttrTypes),
+		}
+		got := r.mgmtModelToSetting(ctx, model, &settings.Mgmt{})
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if got.AutoUpgrade {
+			t.Error("AutoUpgrade should be false for null input")
+		}
+		if got.SSHEnabled {
+			t.Error("SSHEnabled should be false for null input")
+		}
+	})
+
+	t.Run("basic fields set", func(t *testing.T) {
+		model := &settingMgmtModel{
+			AutoUpgrade: testMgmtAutoUpgradeObj(t, types.BoolValue(true), types.Int64Null()),
+			SSH:         testMgmtSSHObj(t, settingMgmtSSHModel{Enabled: types.BoolValue(false)}),
+		}
+		got := r.mgmtModelToSetting(ctx, model, &settings.Mgmt{})
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.AutoUpgrade {
+			t.Error("AutoUpgrade should be true")
+		}
+		if got.SSHEnabled {
+			t.Error("SSHEnabled should be false")
+		}
+	})
+}
+
+func Test_settingResource_mgmtSettingToModel(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null plan fields produce null model fields", func(t *testing.T) {
+		setting := &settings.Mgmt{
+			AutoUpgrade: true,
+			SSHEnabled:  true,
+		}
+		plan := &settingMgmtModel{
+			AutoUpgrade: types.ObjectNull(mgmtAutoUpgradeAttrTypes),
+			SSH:         types.ObjectNull(mgmtSSHAttrTypes),
+		}
+		got := r.mgmtSettingToModel(ctx, setting, plan)
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.AutoUpgrade.IsNull() {
+			t.Error("auto_upgrade should be null when plan is null")
+		}
+		if !got.SSH.IsNull() {
+			t.Error("ssh should be null when plan is null")
+		}
+	})
+
+	t.Run("configured group with unconfigured leaves keeps leaves null", func(t *testing.T) {
+		setting := &settings.Mgmt{AutoUpgrade: true}
+		plan := &settingMgmtModel{
+			AutoUpgrade: testMgmtAutoUpgradeObj(t, types.BoolValue(false), types.Int64Null()),
+			SSH:         types.ObjectNull(mgmtSSHAttrTypes),
+		}
+		got := r.mgmtSettingToModel(ctx, setting, plan)
+		au, ok, _ := util.ObjectAs[settingMgmtAutoUpgradeModel](ctx, got.AutoUpgrade)
+		if !ok {
+			t.Fatalf("auto_upgrade should be known: %v", got.AutoUpgrade)
+		}
+		if !au.Enabled.ValueBool() || !au.Hour.IsNull() {
+			t.Errorf("auto_upgrade = %+v, want enabled=true hour=null", au)
+		}
+	})
+
+	t.Run("non-null plan fields reflect remote value", func(t *testing.T) {
+		setting := &settings.Mgmt{
+			AutoUpgrade: true,
+			SSHEnabled:  false,
+		}
+		plan := &settingMgmtModel{
+			// plan had a value configured
+			AutoUpgrade: testMgmtAutoUpgradeObj(t, types.BoolValue(false), types.Int64Null()),
+			SSH:         testMgmtSSHObj(t, settingMgmtSSHModel{Enabled: types.BoolValue(true)}),
+		}
+		got := r.mgmtSettingToModel(ctx, setting, plan)
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		au, ok, _ := util.ObjectAs[settingMgmtAutoUpgradeModel](ctx, got.AutoUpgrade)
+		if !ok || !au.Enabled.ValueBool() {
+			t.Errorf("auto_upgrade.enabled should reflect remote value (true): %v", got.AutoUpgrade)
+		}
+		ssh, ok, _ := util.ObjectAs[settingMgmtSSHModel](ctx, got.SSH)
+		if !ok || ssh.Enabled.ValueBool() {
+			t.Errorf("ssh.enabled should reflect remote value (false): %v", got.SSH)
+		}
+	})
+}
+
+func Test_settingResource_radiusModelToSetting(t *testing.T) {
+	r := &settingResource{}
+
+	t.Run("null fields leave base unchanged", func(t *testing.T) {
+		authPort := int64(1812)
+		base := &settings.Radius{
+			AccountingEnabled: true,
+			AuthPort:          &authPort,
+		}
+		model := &settingRadiusModel{
+			AccountingEnabled:     types.BoolNull(),
+			AcctPort:              types.Int64Null(),
+			AuthPort:              types.Int64Null(),
+			InterimUpdateInterval: timetypes.NewGoDurationNull(),
+			Secret:                types.StringNull(),
+		}
+		got := r.radiusModelToSetting(context.Background(), model, base)
+		// radiusModelToSetting starts from base and only overlays non-null fields.
+		// Null AccountingEnabled means the base value (true) is left in place.
+		if !got.AccountingEnabled {
+			t.Error("AccountingEnabled should remain true (from base)")
+		}
+	})
+
+	t.Run("non-null fields overlay base", func(t *testing.T) {
+		base := &settings.Radius{}
+		model := &settingRadiusModel{
+			AccountingEnabled:     types.BoolValue(true),
+			AcctPort:              types.Int64Value(1813),
+			AuthPort:              types.Int64Value(1812),
+			InterimUpdateInterval: timetypes.NewGoDurationNull(),
+			Secret:                types.StringValue("mysecret"),
+		}
+		got := r.radiusModelToSetting(context.Background(), model, base)
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.AccountingEnabled {
+			t.Error("AccountingEnabled should be true")
+		}
+		if got.AuthPort == nil || *got.AuthPort != 1812 {
+			t.Errorf("AuthPort = %v, want 1812", got.AuthPort)
+		}
+		if got.Secret != "mysecret" {
+			t.Errorf("Secret = %q, want mysecret", got.Secret)
+		}
+	})
+}
+
+func Test_settingResource_radiusSettingToModel(t *testing.T) {
+	r := &settingResource{}
+
+	t.Run("nil secret plan produces null secret model", func(t *testing.T) {
+		authPort := int64(1812)
+		acctPort := int64(1813)
+		setting := &settings.Radius{
+			AccountingEnabled: true,
+			AuthPort:          &authPort,
+			AcctPort:          &acctPort,
+			Secret:            "remote-secret",
+		}
+		plan := &settingRadiusModel{
+			Secret: types.StringNull(),
+		}
+		got := r.radiusSettingToModel(context.Background(), setting, plan)
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.AccountingEnabled.ValueBool() {
+			t.Error("AccountingEnabled should be true")
+		}
+		// When plan.Secret is null, model.Secret should be null regardless of remote value.
+		if !got.Secret.IsNull() {
+			t.Errorf(
+				"Secret should be null when plan secret is null, got %q",
+				got.Secret.ValueString(),
+			)
+		}
+	})
+
+	t.Run("non-null secret plan reflects remote value", func(t *testing.T) {
+		setting := &settings.Radius{Secret: "the-secret"}
+		plan := &settingRadiusModel{Secret: types.StringValue("old")}
+		got := r.radiusSettingToModel(context.Background(), setting, plan)
+		if got.Secret.ValueString() != "the-secret" {
+			t.Errorf("Secret = %q, want the-secret", got.Secret.ValueString())
+		}
+	})
+}
+
+func Test_settingResource_usgModelToSetting(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null fields produce zero-value setting", func(t *testing.T) {
+		model := &settingUSGModel{
+			FtpModule:       types.BoolNull(),
+			BroadcastPing:   types.BoolNull(),
+			DNSVerification: types.ObjectNull(nil),
+		}
+		got := r.usgModelToSetting(ctx, model, nil)
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if got.FtpModule {
+			t.Error("FtpModule should be false for null input")
+		}
+	})
+
+	t.Run("ftp_module set to true", func(t *testing.T) {
+		model := &settingUSGModel{
+			FtpModule:       types.BoolValue(true),
+			BroadcastPing:   types.BoolNull(),
+			DNSVerification: types.ObjectNull(nil),
+		}
+		got := r.usgModelToSetting(ctx, model, nil)
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.FtpModule {
+			t.Error("FtpModule should be true")
+		}
+	})
+}
+
+func Test_settingResource_usgSettingToModel(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null plan fields produce null model fields", func(t *testing.T) {
+		setting := &usgWithGeo{Usg: &settings.Usg{FtpModule: true, SipModule: true}}
+		plan := &settingUSGModel{
+			FtpModule: types.BoolNull(),
+			SipModule: types.BoolNull(),
+		}
+		got := r.usgSettingToModel(ctx, setting, plan)
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.FtpModule.IsNull() {
+			t.Error("FtpModule should be null when plan is null")
+		}
+	})
+
+	t.Run("non-null plan fields reflect remote value", func(t *testing.T) {
+		setting := &usgWithGeo{Usg: &settings.Usg{FtpModule: true, GreModule: false}}
+		plan := &settingUSGModel{
+			FtpModule: types.BoolValue(false),
+			GreModule: types.BoolValue(true),
+		}
+		got := r.usgSettingToModel(ctx, setting, plan)
+		if !got.FtpModule.ValueBool() {
+			t.Error("FtpModule should be true (remote value)")
+		}
+		if got.GreModule.ValueBool() {
+			t.Error("GreModule should be false (remote value)")
+		}
+	})
+}
+
+func Test_settingResource_igmpSnoopingModelToSetting(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("enabled overlaid onto base", func(t *testing.T) {
+		base := &settings.IgmpSnooping{Enabled: false, QuerierMode: "AUTO"}
+		model := &settingIgmpSnoopingModel{
+			Enabled:    types.BoolValue(true),
+			NetworkIDs: types.ListNull(types.StringType),
+		}
+		var diags diag.Diagnostics
+		got := r.igmpSnoopingModelToSetting(ctx, model, base, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if !got.Enabled {
+			t.Error("Enabled should be true")
+		}
+		// Advanced fields on base must be preserved.
+		if got.QuerierMode != "AUTO" {
+			t.Errorf("QuerierMode = %q, want AUTO", got.QuerierMode)
+		}
+	})
+
+	t.Run("network_ids overlaid onto base", func(t *testing.T) {
+		base := &settings.IgmpSnooping{NetworkIDs: []string{"old-net"}}
+		nids, d := types.ListValueFrom(ctx, types.StringType, []string{"net-1", "net-2"})
+		if d.HasError() {
+			t.Fatalf("building list: %v", d)
+		}
+		model := &settingIgmpSnoopingModel{
+			Enabled:    types.BoolNull(),
+			NetworkIDs: nids,
+		}
+		var diags diag.Diagnostics
+		got := r.igmpSnoopingModelToSetting(ctx, model, base, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if len(got.NetworkIDs) != 2 || got.NetworkIDs[0] != "net-1" {
+			t.Errorf("NetworkIDs = %v, want [net-1 net-2]", got.NetworkIDs)
+		}
+	})
+}
+
+func Test_globalSwitchRawSetting(t *testing.T) {
+	t.Run("only set fields are sent", func(t *testing.T) {
+		var d diag.Diagnostics
+		got := globalSwitchRawSetting(context.Background(), &settingGlobalSwitchModel{
+			StpVersion:           types.StringNull(),
+			DHCPSnoop:            types.BoolUnknown(),
+			JumboframeEnabled:    types.BoolValue(true),
+			Dot1XPortctrlEnabled: types.BoolNull(),
+			AclDeviceIsolation:   types.ListNull(types.StringType),
+		}, &d)
+		if got.Key != "global_switch" {
+			t.Errorf("Key = %q, want global_switch", got.Key)
+		}
+		if len(got.Data) != 1 || got.Data["jumboframe_enabled"] != true {
+			t.Errorf("Data = %v, want only jumboframe_enabled=true", got.Data)
+		}
+	})
+
+	t.Run("false values are sent", func(t *testing.T) {
+		var d diag.Diagnostics
+		got := globalSwitchRawSetting(context.Background(), &settingGlobalSwitchModel{
+			StpVersion:           types.StringValue("disabled"),
+			DHCPSnoop:            types.BoolValue(false),
+			JumboframeEnabled:    types.BoolNull(),
+			Dot1XPortctrlEnabled: types.BoolValue(false),
+			AclDeviceIsolation:   types.ListNull(types.StringType),
+		}, &d)
+		want := map[string]any{
+			"stp_version":            "disabled",
+			"dhcp_snoop":             false,
+			"dot1x_portctrl_enabled": false,
+		}
+		if len(got.Data) != len(want) {
+			t.Fatalf("Data = %v, want %v", got.Data, want)
+		}
+		for k, v := range want {
+			if got.Data[k] != v {
+				t.Errorf("Data[%q] = %v, want %v", k, got.Data[k], v)
+			}
+		}
+	})
+
+	t.Run("marshals with key and fields", func(t *testing.T) {
+		var d diag.Diagnostics
+		got := globalSwitchRawSetting(context.Background(), &settingGlobalSwitchModel{
+			StpVersion:           types.StringNull(),
+			DHCPSnoop:            types.BoolNull(),
+			JumboframeEnabled:    types.BoolValue(false),
+			Dot1XPortctrlEnabled: types.BoolNull(),
+			AclDeviceIsolation:   types.ListNull(types.StringType),
+		}, &d)
+		b, err := json.Marshal(got)
+		if err != nil {
+			t.Fatalf("marshal: %v", err)
+		}
+		var m map[string]any
+		if err := json.Unmarshal(b, &m); err != nil {
+			t.Fatalf("unmarshal: %v", err)
+		}
+		if m["key"] != "global_switch" || m["jumboframe_enabled"] != false {
+			t.Errorf("payload = %s", b)
+		}
+		if _, ok := m["stp_version"]; ok {
+			t.Errorf("unset stp_version must not be sent: %s", b)
+		}
+	})
+}
+
+// TestConnectivityRawSetting covers #518: only the fields the configuration
+// actually sets may reach the controller, so the partial PUT leaves the
+// generated mesh credentials (x_mesh_essid / x_mesh_psk) and any unmodelled
+// option intact.
+func TestConnectivityRawSetting(t *testing.T) {
+	t.Run("only configured fields are sent", func(t *testing.T) {
+		raw := connectivityRawSetting(&settingConnectivityModel{
+			Enabled:        types.BoolValue(false),
+			MloMeshEnabled: types.BoolNull(),
+			UplinkType:     types.StringUnknown(),
+			UplinkHost:     types.StringNull(),
+		})
+		if raw.Key != "connectivity" {
+			t.Errorf("Key = %q, want connectivity", raw.Key)
+		}
+		if len(raw.Data) != 1 {
+			t.Fatalf("want exactly one field, got %v", raw.Data)
+		}
+		if v, ok := raw.Data["enabled"].(bool); !ok || v {
+			t.Errorf("enabled = %v, want a false bool", raw.Data["enabled"])
+		}
+		// The mesh secrets are controller-generated and must never be written.
+		for _, key := range []string{"x_mesh_essid", "x_mesh_psk"} {
+			if _, present := raw.Data[key]; present {
+				t.Errorf("%s must never be sent", key)
+			}
+		}
+	})
+
+	t.Run("nothing configured sends nothing", func(t *testing.T) {
+		raw := connectivityRawSetting(&settingConnectivityModel{
+			Enabled:        types.BoolNull(),
+			MloMeshEnabled: types.BoolUnknown(),
+			UplinkType:     types.StringNull(),
+			UplinkHost:     types.StringUnknown(),
+		})
+		if len(raw.Data) != 0 {
+			t.Errorf("want an empty payload, got %v", raw.Data)
+		}
+	})
+
+	t.Run("all fields travel when set", func(t *testing.T) {
+		raw := connectivityRawSetting(&settingConnectivityModel{
+			Enabled:        types.BoolValue(true),
+			MloMeshEnabled: types.BoolValue(true),
+			UplinkType:     types.StringValue("internet"),
+			UplinkHost:     types.StringValue("1.1.1.1"),
+		})
+		for key, want := range map[string]any{
+			"enabled":          true,
+			"mlo_mesh_enabled": true,
+			"uplink_type":      "internet",
+			"uplink_host":      "1.1.1.1",
+		} {
+			if raw.Data[key] != want {
+				t.Errorf("%s = %v, want %v", key, raw.Data[key], want)
+			}
+		}
+	})
+}
+
+// #509: Client Device Isolation is the acl_device_isolation list on the
+// global_switch setting - a switch ACL, so unlike unifi_wlan.l2_isolation it
+// covers same-network traffic across access points. The list must round-trip,
+// and an unmanaged one must stay off the wire so isolation configured in the UI
+// survives an unrelated change to the block.
+func TestGlobalSwitchAclDeviceIsolation(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("configured networks are sent", func(t *testing.T) {
+		ids, d := types.ListValueFrom(ctx, types.StringType, []string{"net-a", "net-b"})
+		if d.HasError() {
+			t.Fatalf("building the list: %v", d)
+		}
+		var diags diag.Diagnostics
+		raw := globalSwitchRawSetting(ctx, &settingGlobalSwitchModel{
+			AclDeviceIsolation:   ids,
+			StpVersion:           types.StringNull(),
+			DHCPSnoop:            types.BoolNull(),
+			JumboframeEnabled:    types.BoolNull(),
+			Dot1XPortctrlEnabled: types.BoolNull(),
+		}, &diags)
+		if diags.HasError() {
+			t.Fatalf("conversion: %v", diags)
+		}
+		got, ok := raw.Data["acl_device_isolation"].([]string)
+		if !ok {
+			t.Fatalf(
+				"acl_device_isolation = %#v, want a []string",
+				raw.Data["acl_device_isolation"],
+			)
+		}
+		if len(got) != 2 || got[0] != "net-a" || got[1] != "net-b" {
+			t.Errorf("acl_device_isolation = %v, want [net-a net-b]", got)
+		}
+	})
+
+	t.Run("an explicitly empty list clears the setting", func(t *testing.T) {
+		empty, d := types.ListValueFrom(ctx, types.StringType, []string{})
+		if d.HasError() {
+			t.Fatalf("building the list: %v", d)
+		}
+		var diags diag.Diagnostics
+		raw := globalSwitchRawSetting(ctx, &settingGlobalSwitchModel{
+			AclDeviceIsolation:   empty,
+			StpVersion:           types.StringNull(),
+			DHCPSnoop:            types.BoolNull(),
+			JumboframeEnabled:    types.BoolNull(),
+			Dot1XPortctrlEnabled: types.BoolNull(),
+		}, &diags)
+		if diags.HasError() {
+			t.Fatalf("conversion: %v", diags)
+		}
+		got, ok := raw.Data["acl_device_isolation"].([]string)
+		if !ok || got == nil {
+			t.Fatalf("want an empty []string, got %#v", raw.Data["acl_device_isolation"])
+		}
+		if len(got) != 0 {
+			t.Errorf("acl_device_isolation = %v, want empty", got)
+		}
+	})
+
+	t.Run("an unmanaged list stays off the wire", func(t *testing.T) {
+		var diags diag.Diagnostics
+		raw := globalSwitchRawSetting(ctx, &settingGlobalSwitchModel{
+			AclDeviceIsolation:   types.ListNull(types.StringType),
+			StpVersion:           types.StringNull(),
+			DHCPSnoop:            types.BoolNull(),
+			JumboframeEnabled:    types.BoolNull(),
+			Dot1XPortctrlEnabled: types.BoolNull(),
+		}, &diags)
+		if diags.HasError() {
+			t.Fatalf("conversion: %v", diags)
+		}
+		if _, present := raw.Data["acl_device_isolation"]; present {
+			t.Error("an unmanaged acl_device_isolation must not be sent")
+		}
+	})
+
+	t.Run("the controller list is read back", func(t *testing.T) {
+		r := &settingResource{}
+		var diags diag.Diagnostics
+		got := r.globalSwitchSettingToModel(ctx, &settings.GlobalSwitch{
+			AclDeviceIsolation: []string{"net-a"},
+			StpVersion:         "rstp",
+		}, &diags)
+		if diags.HasError() {
+			t.Fatalf("conversion: %v", diags)
+		}
+		var ids []string
+		got.AclDeviceIsolation.ElementsAs(ctx, &ids, false)
+		if len(ids) != 1 || ids[0] != "net-a" {
+			t.Errorf("acl_device_isolation = %v, want [net-a]", ids)
+		}
+	})
+}
+
+func Test_settingResource_connectivitySettingToModel(t *testing.T) {
+	r := &settingResource{}
+	got := r.connectivitySettingToModel(&settings.Connectivity{
+		Enabled:        true,
+		MloMeshEnabled: false,
+		UplinkType:     "gateway",
+		// Generated secrets exist on the setting but must not surface.
+		MeshEssid: "unifi-mesh",
+		MeshPsk:   "shouldnotleak",
+	})
+	if !got.Enabled.ValueBool() {
+		t.Error("Enabled should be true")
+	}
+	if got.MloMeshEnabled.IsNull() || got.MloMeshEnabled.ValueBool() {
+		t.Error("MloMeshEnabled should be a known false")
+	}
+	if got.UplinkType.ValueString() != "gateway" {
+		t.Errorf("UplinkType = %q, want gateway", got.UplinkType.ValueString())
+	}
+	// An uplink_host the controller does not store reads back null, not "".
+	if !got.UplinkHost.IsNull() {
+		t.Errorf("UplinkHost = %v, want null", got.UplinkHost)
+	}
+	if _, d := types.ObjectValueFrom(
+		context.Background(),
+		connectivityAttrTypes,
+		got,
+	); d.HasError() {
+		t.Fatalf("model does not match connectivityAttrTypes: %v", d)
+	}
+}
+
+func Test_settingResource_globalSwitchSettingToModel(t *testing.T) {
+	r := &settingResource{}
+	var gsDiags diag.Diagnostics
+	got := r.globalSwitchSettingToModel(context.Background(), &settings.GlobalSwitch{
+		StpVersion:           "stp",
+		DHCPSnoop:            true,
+		JumboframeEnabled:    true,
+		Dot1XPortctrlEnabled: false,
+	}, &gsDiags)
+	if got.StpVersion.ValueString() != "stp" {
+		t.Errorf("StpVersion = %q, want stp", got.StpVersion.ValueString())
+	}
+	if !got.DHCPSnoop.ValueBool() || !got.JumboframeEnabled.ValueBool() {
+		t.Error("DHCPSnoop and JumboframeEnabled should be true")
+	}
+	if got.Dot1XPortctrlEnabled.IsNull() || got.Dot1XPortctrlEnabled.ValueBool() {
+		t.Error("Dot1XPortctrlEnabled should be a known false")
+	}
+	if _, d := types.ObjectValueFrom(
+		context.Background(),
+		globalSwitchAttrTypes,
+		got,
+	); d.HasError() {
+		t.Fatalf("model does not match globalSwitchAttrTypes: %v", d)
+	}
+}
+
+// Omitted global_switch fields must keep their prior values rather than
+// planning as "known after apply" on every run (same failure mode as #382).
+func TestSettingGlobalSwitchUseStateForUnknown(t *testing.T) {
+	ctx := context.Background()
+	resp := &fwresource.SchemaResponse{}
+	(&settingResource{}).Schema(ctx, fwresource.SchemaRequest{}, resp)
+
+	gs, ok := resp.Schema.Attributes["global_switch"].(schema.SingleNestedAttribute)
+	if !ok {
+		t.Fatal("global_switch is not a SingleNestedAttribute")
+	}
+	if len(gs.Attributes) != len(globalSwitchAttrTypes) {
+		t.Fatalf(
+			"global_switch has %d attributes, want %d",
+			len(gs.Attributes),
+			len(globalSwitchAttrTypes),
+		)
+	}
+
+	for key, a := range gs.Attributes {
+		if !a.IsOptional() || !a.IsComputed() {
+			t.Errorf("global_switch.%s must be Optional+Computed", key)
+		}
+		switch v := a.(type) {
+		case schema.StringAttribute:
+			if len(v.PlanModifiers) == 0 {
+				t.Errorf("global_switch.%s must use UseStateForUnknown", key)
+				continue
+			}
+			req := planmodifier.StringRequest{
+				ConfigValue: types.StringNull(),
+				PlanValue:   types.StringUnknown(),
+				State:       tfsdk.State{Raw: tftypes.NewValue(tftypes.String, "rstp")},
+				StateValue:  types.StringValue("rstp"),
+			}
+			modified := &planmodifier.StringResponse{PlanValue: req.PlanValue}
+			for _, m := range v.PlanModifiers {
+				m.PlanModifyString(ctx, req, modified)
+				req.PlanValue = modified.PlanValue
+			}
+			if modified.Diagnostics.HasError() {
+				t.Errorf(
+					"global_switch.%s plan modifier returned errors: %v",
+					key,
+					modified.Diagnostics,
+				)
+			}
+			if modified.PlanValue.IsUnknown() || modified.PlanValue.ValueString() != "rstp" {
+				t.Errorf(
+					"global_switch.%s plan = %v, want prior state \"rstp\"",
+					key,
+					modified.PlanValue,
+				)
+			}
+		case schema.BoolAttribute:
+			if len(v.PlanModifiers) == 0 {
+				t.Errorf("global_switch.%s must use UseStateForUnknown", key)
+				continue
+			}
+			req := planmodifier.BoolRequest{
+				ConfigValue: types.BoolNull(),
+				PlanValue:   types.BoolUnknown(),
+				State:       tfsdk.State{Raw: tftypes.NewValue(tftypes.Bool, true)},
+				StateValue:  types.BoolValue(true),
+			}
+			modified := &planmodifier.BoolResponse{PlanValue: req.PlanValue}
+			for _, m := range v.PlanModifiers {
+				m.PlanModifyBool(ctx, req, modified)
+				req.PlanValue = modified.PlanValue
+			}
+			if modified.Diagnostics.HasError() {
+				t.Errorf(
+					"global_switch.%s plan modifier returned errors: %v",
+					key,
+					modified.Diagnostics,
+				)
+			}
+			if modified.PlanValue.IsUnknown() || !modified.PlanValue.ValueBool() {
+				t.Errorf(
+					"global_switch.%s plan = %v, want prior state true",
+					key,
+					modified.PlanValue,
+				)
+			}
+		case schema.ListAttribute:
+			prior, d := types.ListValueFrom(
+				ctx,
+				types.StringType,
+				[]string{"net-1"},
+			)
+			if d.HasError() {
+				t.Fatalf("building the prior list: %v", d)
+			}
+			req := planmodifier.ListRequest{
+				ConfigValue: types.ListNull(types.StringType),
+				PlanValue:   types.ListUnknown(types.StringType),
+				State: tfsdk.State{Raw: tftypes.NewValue(
+					tftypes.List{ElementType: tftypes.String},
+					[]tftypes.Value{tftypes.NewValue(tftypes.String, "net-1")},
+				)},
+				StateValue: prior,
+			}
+			modified := &planmodifier.ListResponse{PlanValue: req.PlanValue}
+			for _, m := range v.PlanModifiers {
+				m.PlanModifyList(ctx, req, modified)
+				req.PlanValue = modified.PlanValue
+			}
+			if modified.Diagnostics.HasError() {
+				t.Errorf(
+					"global_switch.%s plan modifier returned errors: %v",
+					key,
+					modified.Diagnostics,
+				)
+			}
+			if modified.PlanValue.IsUnknown() || modified.PlanValue.Equal(
+				types.ListNull(types.StringType),
+			) {
+				t.Errorf(
+					"global_switch.%s plan = %v, want the prior state list",
+					key,
+					modified.PlanValue,
+				)
+			}
+		default:
+			t.Errorf("global_switch.%s has unexpected type %T", key, a)
+		}
+	}
+}
+
+func Test_settingResource_igmpSnoopingSettingToModel(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("basic fields mapped", func(t *testing.T) {
+		setting := &settings.IgmpSnooping{
+			Enabled:    true,
+			NetworkIDs: []string{"net-a", "net-b"},
+		}
+		var diags diag.Diagnostics
+		got := r.igmpSnoopingSettingToModel(ctx, setting, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.Enabled.ValueBool() {
+			t.Error("Enabled should be true")
+		}
+		var ids []string
+		if d := got.NetworkIDs.ElementsAs(ctx, &ids, false); d.HasError() {
+			t.Fatalf("reading network_ids: %v", d)
+		}
+		if len(ids) != 2 {
+			t.Errorf("NetworkIDs len = %d, want 2", len(ids))
+		}
+	})
+
+	t.Run("empty network ids", func(t *testing.T) {
+		setting := &settings.IgmpSnooping{Enabled: false, NetworkIDs: nil}
+		var diags diag.Diagnostics
+		got := r.igmpSnoopingSettingToModel(ctx, setting, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got.Enabled.ValueBool() {
+			t.Error("Enabled should be false")
+		}
+	})
+}
+
+func Test_settingResource_dohModelToSetting(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null fields produce empty setting", func(t *testing.T) {
+		model := &settingDohModel{
+			State:         types.StringNull(),
+			ServerNames:   types.ListNull(types.StringType),
+			CustomServers: types.ListNull(types.StringType),
+		}
+		var diags diag.Diagnostics
+		got := r.dohModelToSetting(ctx, model, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if got.State != "" {
+			t.Errorf("State should be empty, got %q", got.State)
+		}
+	})
+
+	t.Run("state set", func(t *testing.T) {
+		model := &settingDohModel{
+			State:         types.StringValue("auto"),
+			ServerNames:   types.ListNull(types.StringType),
+			CustomServers: types.ListNull(types.StringType),
+		}
+		var diags diag.Diagnostics
+		got := r.dohModelToSetting(ctx, model, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got.State != "auto" {
+			t.Errorf("State = %q, want auto", got.State)
+		}
+	})
+}
+
+func Test_settingResource_dohSettingToModel(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null plan state produces null model state", func(t *testing.T) {
+		setting := &settings.Doh{State: "auto"}
+		plan := &settingDohModel{
+			State:         types.StringNull(),
+			ServerNames:   types.ListNull(types.StringType),
+			CustomServers: types.ListNull(types.StringType),
+		}
+		var diags diag.Diagnostics
+		got := r.dohSettingToModel(ctx, setting, plan, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.State.IsNull() {
+			t.Errorf("State should be null when plan is null, got %q", got.State.ValueString())
+		}
+	})
+
+	t.Run("non-null plan state reflects remote value", func(t *testing.T) {
+		setting := &settings.Doh{State: "off"}
+		plan := &settingDohModel{
+			State:         types.StringValue("auto"),
+			ServerNames:   types.ListNull(types.StringType),
+			CustomServers: types.ListNull(types.StringType),
+		}
+		var diags diag.Diagnostics
+		got := r.dohSettingToModel(ctx, setting, plan, &diags)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got.State.ValueString() != "off" {
+			t.Errorf("State = %q, want off", got.State.ValueString())
+		}
+	})
+}
+
+func Test_settingResource_ipsModelToSetting(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null fields produce empty setting", func(t *testing.T) {
+		model := &settingIpsModel{
+			IPSMode:          types.StringNull(),
+			HoneypotEnabled:  types.BoolNull(),
+			RestrictTorrents: types.BoolNull(),
+		}
+		var diags diag.Diagnostics
+		got, _ := r.ipsModelToSetting(ctx, model, &diags, nil)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if got.IPsMode != "" {
+			t.Errorf("IPsMode should be empty, got %q", got.IPsMode)
+		}
+	})
+
+	t.Run("ips_mode and restrict_torrents set", func(t *testing.T) {
+		model := &settingIpsModel{
+			IPSMode:          types.StringValue("disabled"),
+			RestrictTorrents: types.BoolValue(true),
+			HoneypotEnabled:  types.BoolNull(),
+		}
+		var diags diag.Diagnostics
+		got, _ := r.ipsModelToSetting(ctx, model, &diags, nil)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got.IPsMode != "disabled" {
+			t.Errorf("IPsMode = %q, want disabled", got.IPsMode)
+		}
+		if !got.RestrictTorrents {
+			t.Error("RestrictTorrents should be true")
+		}
+	})
+}
+
+func Test_settingResource_ipsSettingToModel(t *testing.T) {
+	r := &settingResource{}
+	ctx := context.Background()
+
+	t.Run("null plan ips_mode produces null model ips_mode", func(t *testing.T) {
+		setting := &settings.Ips{IPsMode: "ips"}
+		plan := &settingIpsModel{
+			IPSMode: types.StringNull(),
+		}
+		var diags diag.Diagnostics
+		got := r.ipsSettingToModel(ctx, setting, plan, &diags, nil)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got == nil {
+			t.Fatal("expected non-nil result")
+		}
+		if !got.IPSMode.IsNull() {
+			t.Errorf("IPSMode should be null when plan is null, got %q", got.IPSMode.ValueString())
+		}
+	})
+
+	t.Run("non-null plan reflects remote value", func(t *testing.T) {
+		setting := &settings.Ips{IPsMode: "disabled", RestrictTorrents: true}
+		plan := &settingIpsModel{
+			IPSMode:          types.StringValue("ips"),
+			RestrictTorrents: types.BoolValue(false),
+		}
+		var diags diag.Diagnostics
+		got := r.ipsSettingToModel(ctx, setting, plan, &diags, nil)
+		if diags.HasError() {
+			t.Fatalf("unexpected diags: %v", diags)
+		}
+		if got.IPSMode.ValueString() != "disabled" {
+			t.Errorf("IPSMode = %q, want disabled", got.IPSMode.ValueString())
+		}
+		if !got.RestrictTorrents.ValueBool() {
+			t.Error("RestrictTorrents should be true (remote value)")
+		}
+	})
+}
+
+// TestIgmpSnoopingModelMerge guards #164: the site-level igmp_snooping setting
+// exposes only enabled + network_ids, and the model->setting conversion must
+// overlay those onto the current remote setting so advanced querier/flood
+// fields configured in the UI are preserved across an update.
+func TestIgmpSnoopingModelMerge(t *testing.T) {
+	ctx := context.Background()
+	r := &settingResource{}
+	var diags diag.Diagnostics
+
+	// Current remote setting with advanced fields that must survive.
+	base := &settings.IgmpSnooping{
+		Enabled:             false,
+		QuerierMode:         "CUSTOM",
+		QuerierSwitches:     []string{"aa:bb:cc:dd:ee:ff"},
+		FloodKnownProtocols: true,
+	}
+	nids, d := types.ListValueFrom(ctx, types.StringType, []string{"net-1", "net-2"})
+	if d.HasError() {
+		t.Fatalf("building network_ids: %v", d)
+	}
+	model := &settingIgmpSnoopingModel{
+		Enabled:    types.BoolValue(true),
+		NetworkIDs: nids,
+	}
+
+	out := r.igmpSnoopingModelToSetting(ctx, model, base, &diags)
+	if diags.HasError() {
+		t.Fatalf("igmpSnoopingModelToSetting: %v", diags)
+	}
+	if !out.Enabled {
+		t.Error("Enabled not applied from model")
+	}
+	if len(out.NetworkIDs) != 2 || out.NetworkIDs[0] != "net-1" {
+		t.Errorf("NetworkIDs = %v, want [net-1 net-2]", out.NetworkIDs)
+	}
+	// Advanced fields must be preserved from base (not dropped).
+	if out.QuerierMode != "CUSTOM" || len(out.QuerierSwitches) != 1 || !out.FloodKnownProtocols {
+		t.Errorf("advanced fields not preserved: querier_mode=%q querier_switches=%v flood=%v",
+			out.QuerierMode, out.QuerierSwitches, out.FloodKnownProtocols)
+	}
+
+	// Read-back conversion.
+	m := r.igmpSnoopingSettingToModel(ctx, out, &diags)
+	if diags.HasError() {
+		t.Fatalf("igmpSnoopingSettingToModel: %v", diags)
+	}
+	if !m.Enabled.ValueBool() {
+		t.Error("model Enabled = false, want true")
+	}
+	var ids []string
+	if d := m.NetworkIDs.ElementsAs(ctx, &ids, false); d.HasError() {
+		t.Fatalf("reading model network_ids: %v", d)
+	}
+	if len(ids) != 2 {
+		t.Errorf("model network_ids = %v, want 2", ids)
+	}
+}
+
+// TestAutoSpeedtestSettingRoundTrip is a unit round-trip for the auto_speedtest
+// setting block (#272): model -> go-unifi setting -> model preserves the fields.
+func TestAutoSpeedtestSettingRoundTrip(t *testing.T) {
+	r := &settingResource{}
+	in := &settingAutoSpeedtestModel{
+		Enabled:  types.BoolValue(true),
+		CronExpr: types.StringValue("0 3 * * *"),
+	}
+	setting := r.autoSpeedtestModelToSetting(in)
+	if !setting.Enabled || setting.CronExpr != "0 3 * * *" {
+		t.Fatalf("modelToSetting = %+v, want enabled cron=0 3 * * *", setting)
+	}
+	out := r.autoSpeedtestSettingToModel(setting)
+	if !out.Enabled.ValueBool() || out.CronExpr.ValueString() != "0 3 * * *" {
+		t.Errorf("settingToModel = %+v, want enabled cron preserved", out)
+	}
+}
+
+// TestNtpSettingStateNormalization guards #382: the controller represents
+// unset NTP servers as "", which is a valid configured value and must not be
+// rewritten to null during the post-apply read.
+func TestNtpSettingStateNormalization(t *testing.T) {
+	r := &settingResource{}
+	apiSetting := r.ntpModelToSetting(&settingNtpModel{
+		NtpServer1:        types.StringValue("pool.ntp.org"),
+		NtpServer2:        types.StringValue(""),
+		NtpServer3:        types.StringNull(),
+		NtpServer4:        types.StringNull(),
+		SettingPreference: types.StringValue("manual"),
+	})
+
+	state := r.ntpSettingToModel(apiSetting)
+	if state.NtpServer1.ValueString() != "pool.ntp.org" {
+		t.Errorf("ntp_server_1 = %q, want pool.ntp.org", state.NtpServer1.ValueString())
+	}
+	for key, value := range map[string]types.String{
+		"ntp_server_2": state.NtpServer2,
+		"ntp_server_3": state.NtpServer3,
+		"ntp_server_4": state.NtpServer4,
+	} {
+		if value.IsNull() || value.IsUnknown() || value.ValueString() != "" {
+			t.Errorf("%s = %v, want known empty string", key, value)
+		}
+	}
+}
+
+// TestSettingBlocksRoundTrip covers the model<->go-unifi conversions for the
+// settings added in #273 (a representative scalar block and the list-bearing one).
+func TestSettingBlocksRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	r := &settingResource{}
+
+	t.Run("ntp", func(t *testing.T) {
+		in := &settingNtpModel{
+			NtpServer1:        types.StringValue("pool.ntp.org"),
+			SettingPreference: types.StringValue("manual"),
+		}
+		out := r.ntpSettingToModel(r.ntpModelToSetting(in))
+		if out.NtpServer1.ValueString() != "pool.ntp.org" ||
+			out.SettingPreference.ValueString() != "manual" {
+			t.Errorf("ntp round-trip mismatch: %+v", out)
+		}
+	})
+
+	t.Run("syslog", func(t *testing.T) {
+		var diags diag.Diagnostics
+		contents, _ := types.ListValueFrom(ctx, types.StringType, []string{"device", "client"})
+		in := &settingSyslogModel{
+			Enabled:  types.BoolValue(true),
+			IP:       types.StringValue("10.0.0.9"),
+			Port:     types.Int64Value(514),
+			Contents: contents,
+		}
+		setting := r.syslogModelToSetting(ctx, in, &diags)
+		if diags.HasError() {
+			t.Fatalf("modelToSetting: %v", diags)
+		}
+		if !setting.Enabled || setting.IP != "10.0.0.9" || setting.Port == nil ||
+			*setting.Port != 514 || len(setting.Contents) != 2 {
+			t.Fatalf("syslog modelToSetting mismatch: %+v", setting)
+		}
+		out := r.syslogSettingToModel(ctx, setting, &diags)
+		if diags.HasError() {
+			t.Fatalf("settingToModel: %v", diags)
+		}
+		var gotContents []string
+		out.Contents.ElementsAs(ctx, &gotContents, false)
+		if out.IP.ValueString() != "10.0.0.9" || len(gotContents) != 2 {
+			t.Errorf("syslog round-trip mismatch: %+v", out)
+		}
+	})
+}
+
+// TestMgmtNewFields guards #274: the new mgmt fields overlay onto the current
+// remote setting (read-base, so unmanaged fields aren't clobbered) and the
+// secret ssh_password is preserved from the plan (the controller never echoes it).
+func TestMgmtNewFields(t *testing.T) {
+	ctx := context.Background()
+	r := &settingResource{}
+
+	// Base has a field the user does NOT manage; it must survive.
+	base := &settings.Mgmt{WifimanEnabled: true}
+	model := &settingMgmtModel{
+		SSH: testMgmtSSHObj(t, settingMgmtSSHModel{
+			Username:            types.StringValue("admin"),
+			Password:            types.StringValue("s3cret"),
+			AuthPasswordEnabled: types.BoolValue(true),
+		}),
+		AdvancedFeatureEnabled: types.BoolValue(true),
+	}
+	setting := r.mgmtModelToSetting(ctx, model, base)
+	if !setting.WifimanEnabled {
+		t.Error("read-base field WifimanEnabled was clobbered")
+	}
+	if setting.SSHUsername != "admin" || setting.SSHPassword != "s3cret" ||
+		!setting.SSHAuthPasswordEnabled || !setting.AdvancedFeatureEnabled {
+		t.Errorf("overlay missing: %+v", setting)
+	}
+
+	// On read, ssh_password is preserved from the plan (API returns no plaintext).
+	plan := &settingMgmtModel{
+		SSH: testMgmtSSHObj(t, settingMgmtSSHModel{
+			Username: types.StringValue("admin"),
+			Password: types.StringValue("s3cret"),
+		}),
+	}
+	out := r.mgmtSettingToModel(ctx, &settings.Mgmt{SSHUsername: "admin"}, plan)
+	outSSH, ok, _ := util.ObjectAs[settingMgmtSSHModel](ctx, out.SSH)
+	if !ok {
+		t.Fatalf("ssh should be known: %v", out.SSH)
+	}
+	if outSSH.Password.ValueString() != "s3cret" {
+		t.Errorf("ssh.password not preserved: %q", outSSH.Password.ValueString())
+	}
+	if outSSH.Username.ValueString() != "admin" {
+		t.Errorf("ssh.username = %q, want admin", outSSH.Username.ValueString())
+	}
+	// An unconfigured field stays null (no drift on unmanaged settings).
+	if !out.WifimanEnabled.IsNull() {
+		t.Error("unconfigured wifiman_enabled should be null")
+	}
+}
+
+// TestIpsSuppressionAlertsRoundTrip guards #275: signature alert suppression
+// (incl. gid/id pointers and the nested tracking list) round-trips model<->setting.
+func TestIpsSuppressionAlertsRoundTrip(t *testing.T) {
+	ctx := context.Background()
+	var diags diag.Diagnostics
+	r := &settingResource{}
+
+	tracking, _ := types.ListValueFrom(ctx, types.ObjectType{AttrTypes: ipsTrackingAttrTypes},
+		[]settingIpsTrackingModel{{
+			Direction: types.StringValue("both"),
+			Mode:      types.StringValue("ip"),
+			Value:     types.StringValue("10.0.0.5"),
+		}})
+	alerts, _ := types.ListValueFrom(ctx, types.ObjectType{AttrTypes: ipsAlertAttrTypes},
+		[]settingIpsAlertModel{{
+			Category:  types.StringValue("malware"),
+			Gid:       types.Int64Value(1),
+			ID:        types.Int64Value(2001),
+			Signature: types.StringValue("ET MALWARE"),
+			Type:      types.StringValue("track"),
+			Tracking:  tracking,
+		}})
+
+	model := &settingIpsModel{
+		EnabledCategories: types.ListNull(types.StringType),
+		EnabledNetworks:   types.ListNull(types.StringType),
+		Honeypot:          types.ListNull(types.ObjectType{AttrTypes: ipsHoneypotAttrTypes}),
+		Suppression: testSettingObj(t, ipsSuppressionAttrTypes, settingIpsSuppressionModel{
+			Whitelist: types.ListNull(types.ObjectType{AttrTypes: ipsWhitelistAttrTypes}),
+			Alerts:    alerts,
+		}),
+	}
+	setting, suppression := r.ipsModelToSetting(ctx, model, &diags, nil)
+	if diags.HasError() {
+		t.Fatalf("modelToSetting: %v", diags)
+	}
+	if suppression == nil || len(suppression.Alerts) != 1 {
+		t.Fatalf("alerts not built: %+v", suppression)
+	}
+	a := suppression.Alerts[0]
+	if a.Category != "malware" || a.Gid == nil || *a.Gid != 1 || a.ID == nil || *a.ID != 2001 ||
+		a.Type != "track" || len(a.Tracking) != 1 || a.Tracking[0].Value != "10.0.0.5" {
+		t.Fatalf("alert mismatch: %+v", a)
+	}
+
+	out := r.ipsSettingToModel(ctx, setting, model, &diags, suppression)
+	if diags.HasError() {
+		t.Fatalf("settingToModel: %v", diags)
+	}
+	outSupp, ok, _ := util.ObjectAs[settingIpsSuppressionModel](ctx, out.Suppression)
+	if !ok {
+		t.Fatalf("suppression should be known: %v", out.Suppression)
+	}
+	var outAlerts []settingIpsAlertModel
+	outSupp.Alerts.ElementsAs(ctx, &outAlerts, false)
+	if len(outAlerts) != 1 || outAlerts[0].Signature.ValueString() != "ET MALWARE" ||
+		outAlerts[0].Gid.ValueInt64() != 1 {
+		t.Errorf("read-back alerts mismatch: %+v", outAlerts)
+	}
+}
+
+// TestSyslogOmitsUnsetPorts guards #303: an unset port / netconsole_port must be
+// omitted (nil pointer), not serialized as 0 — the controller rejects port 0.
+func TestSyslogOmitsUnsetPorts(t *testing.T) {
+	ctx := context.Background()
+	var diags diag.Diagnostics
+	r := &settingResource{}
+
+	m := &settingSyslogModel{
+		Enabled: types.BoolValue(true),
+		IP:      types.StringValue("10.0.10.15"),
+		Port:    types.Int64Value(1514),
+		Netconsole: testSettingObj(t, syslogNetconsoleAttrTypes, settingSyslogNetconsoleModel{
+			Enabled: types.BoolValue(false),
+			Host:    types.StringNull(),
+			Port:    types.Int64Null(), // netconsole disabled / unset
+		}),
+		ThisController: types.ObjectNull(syslogThisControllerAttrTypes),
+		Contents:       types.ListNull(types.StringType),
+	}
+	setting := r.syslogModelToSetting(ctx, m, &diags)
+	if diags.HasError() {
+		t.Fatalf("modelToSetting: %v", diags)
+	}
+	if setting.NetconsolePort != nil {
+		t.Errorf("netconsole.port must be omitted when unset, got %d", *setting.NetconsolePort)
+	}
+	if setting.Port == nil || *setting.Port != 1514 {
+		t.Errorf("port = %v, want 1514", setting.Port)
+	}
+
+	// Unknown (Optional+Computed at create) must also omit, not send 0.
+	m.Port = types.Int64Unknown()
+	m.Netconsole = testSettingObj(t, syslogNetconsoleAttrTypes, settingSyslogNetconsoleModel{
+		Enabled: types.BoolValue(true),
+		Host:    types.StringUnknown(),
+		Port:    types.Int64Unknown(),
+	})
+	setting = r.syslogModelToSetting(ctx, m, &diags)
+	if setting.Port != nil {
+		t.Errorf("unknown port must be omitted, got %d", *setting.Port)
+	}
+	if setting.NetconsolePort != nil {
+		t.Errorf("unknown netconsole.port must be omitted, got %d", *setting.NetconsolePort)
+	}
+	if !setting.NetconsoleEnabled || setting.NetconsoleHost != "" {
+		t.Errorf("netconsole = enabled:%v host:%q, want enabled:true host:\"\"",
+			setting.NetconsoleEnabled, setting.NetconsoleHost)
+	}
+
+	// A wholly unknown group (omitted block at create) contributes nothing.
+	m.Netconsole = types.ObjectUnknown(syslogNetconsoleAttrTypes)
+	setting = r.syslogModelToSetting(ctx, m, &diags)
+	if diags.HasError() {
+		t.Fatalf("modelToSetting with unknown group: %v", diags)
+	}
+	if setting.NetconsoleEnabled || setting.NetconsoleHost != "" || setting.NetconsolePort != nil {
+		t.Errorf("unknown netconsole group must serialize zero values: %+v", setting)
+	}
+}
+
+// TestLcmOmitsUnsetInts guards the same #303 pattern for the lcm block.
+func TestLcmOmitsUnsetInts(t *testing.T) {
+	r := &settingResource{}
+	setting := r.lcmModelToSetting(&settingLcmModel{
+		Enabled:     types.BoolValue(true),
+		Brightness:  types.Int64Null(),
+		IdleTimeout: types.Int64Unknown(),
+	})
+	if setting.Brightness != nil || setting.IDleTimeout != nil {
+		t.Errorf("unset lcm ints must be omitted: brightness=%v idle=%v",
+			setting.Brightness, setting.IDleTimeout)
+	}
+}
+
+// TestIpsSuppressionFromRaw guards the #381 read path: newer controllers store
+// suppression under the standalone ips_suppression setting, whose raw payload
+// (decoded as map[string]any, so numbers arrive as float64) must convert into
+// the nested suppression struct the ips conversions consume.
+func TestIpsSuppressionFromRaw(t *testing.T) {
+	raw := map[string]any{
+		"_id":     "69d1925309e6659556d6e2f4",
+		"site_id": "62e7da55ac20a206e6945eea",
+		"key":     "ips_suppression",
+		"alerts": []any{
+			map[string]any{
+				"category":  "emerging-scan",
+				"gid":       float64(1),
+				"id":        float64(2003068),
+				"signature": "ET SCAN Potential SSH Scan OUTBOUND",
+				"type":      "track",
+				"tracking": []any{
+					map[string]any{
+						"direction": "both",
+						"mode":      "ip",
+						"value":     "10.0.0.5",
+					},
+				},
+			},
+		},
+		"whitelist": []any{
+			map[string]any{"direction": "src", "mode": "subnet", "value": "10.0.0.0/24"},
+		},
+	}
+
+	supp, err := ipsSuppressionFromRaw(raw)
+	if err != nil {
+		t.Fatalf("ipsSuppressionFromRaw: %v", err)
+	}
+	if len(supp.Alerts) != 1 || len(supp.Whitelist) != 1 {
+		t.Fatalf("unexpected counts: %+v", supp)
+	}
+	a := supp.Alerts[0]
+	if a.Gid == nil || *a.Gid != 1 || a.ID == nil || *a.ID != 2003068 {
+		t.Errorf("gid/id mismatch: gid=%v id=%v", a.Gid, a.ID)
+	}
+	if a.Signature != "ET SCAN Potential SSH Scan OUTBOUND" || a.Category != "emerging-scan" ||
+		a.Type != "track" {
+		t.Errorf("alert mismatch: %+v", a)
+	}
+	if len(a.Tracking) != 1 || a.Tracking[0].Value != "10.0.0.5" {
+		t.Errorf("tracking mismatch: %+v", a.Tracking)
+	}
+	if supp.Whitelist[0].Mode != "subnet" || supp.Whitelist[0].Value != "10.0.0.0/24" {
+		t.Errorf("whitelist mismatch: %+v", supp.Whitelist[0])
+	}
+}
+
+// TestIpsSuppressionRawSetting guards the #381 write path: the standalone
+// setting must carry the ips_suppression key and serialize nil entry slices
+// as empty JSON arrays (clearing the last entry must clear the controller,
+// and the endpoint rejects null lists).
+func TestIpsSuppressionRawSetting(t *testing.T) {
+	gid := int64(1)
+	id := int64(2003068)
+	raw := ipsSuppressionRawSetting(&settings.IpsSuppression{
+		Alerts: []settings.SettingIpsSuppressionAlerts{{
+			Category:  "emerging-scan",
+			Gid:       &gid,
+			ID:        &id,
+			Signature: "ET SCAN Potential SSH Scan OUTBOUND",
+			Type:      "all",
+		}},
+	})
+	if raw.Key != "ips_suppression" {
+		t.Fatalf("key = %q, want ips_suppression", raw.Key)
+	}
+
+	buf, err := raw.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var decoded struct {
+		Key       string                                    `json:"key"`
+		Alerts    []settings.SettingIpsSuppressionAlerts    `json:"alerts"`
+		Whitelist []settings.SettingIpsSuppressionWhitelist `json:"whitelist"`
+	}
+	if err := json.Unmarshal(buf, &decoded); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+	if decoded.Key != "ips_suppression" || len(decoded.Alerts) != 1 {
+		t.Fatalf("payload mismatch: %s", buf)
+	}
+	if decoded.Whitelist == nil || len(decoded.Whitelist) != 0 {
+		t.Errorf("nil whitelist must serialize as []: %s", buf)
+	}
+
+	// Fully empty suppression: both lists still serialize as [].
+	raw = ipsSuppressionRawSetting(&settings.IpsSuppression{})
+	buf, err = raw.MarshalJSON()
+	if err != nil {
+		t.Fatalf("marshal empty: %v", err)
+	}
+	var decodedEmpty map[string]any
+	if err := json.Unmarshal(buf, &decodedEmpty); err != nil {
+		t.Fatalf("unmarshal empty: %v", err)
+	}
+	if v, ok := decodedEmpty["alerts"].([]any); !ok || len(v) != 0 {
+		t.Errorf("alerts must be an empty array: %s", buf)
+	}
+	if v, ok := decodedEmpty["whitelist"].([]any); !ok || len(v) != 0 {
+		t.Errorf("whitelist must be an empty array: %s", buf)
+	}
+}
+
+// TestIpsSuppressionConfigured covers the plan gate for the #381 fallback
+// read: only a plan that manages at least one suppression list triggers the
+// standalone-setting lookup.
+func TestIpsSuppressionConfigured(t *testing.T) {
+	whitelistType := types.ObjectType{AttrTypes: ipsWhitelistAttrTypes}
+	alertType := types.ObjectType{AttrTypes: ipsAlertAttrTypes}
+
+	unmanaged := &settingIpsSuppressionModel{
+		Alerts:    types.ListNull(alertType),
+		Whitelist: types.ListNull(whitelistType),
+	}
+	if ipsSuppressionConfigured(unmanaged) {
+		t.Error("null lists must not count as configured")
+	}
+
+	empty, _ := types.ListValueFrom(context.Background(), alertType, []settingIpsAlertModel{})
+	managed := &settingIpsSuppressionModel{
+		Alerts:    empty,
+		Whitelist: types.ListNull(whitelistType),
+	}
+	if !ipsSuppressionConfigured(managed) {
+		t.Error("an empty configured list must count as configured")
+	}
+}
+
+// TestUsgGeoRawSetting guards the #374 write path: the standalone usg_geo
+// setting must carry the ip_filtering payload with the legacy block field
+// mapped to action, and only configured fields present (enabled always,
+// matching the always-serialized legacy usg field).
+func TestUsgGeoRawSetting(t *testing.T) {
+	raw := usgGeoRawSetting(&settingUsgGeoIPFilteringModel{
+		Enabled:          types.BoolValue(true),
+		Block:            types.StringValue("block"),
+		Countries:        types.StringValue("KP,RU"),
+		TrafficDirection: types.StringValue("both"),
+	})
+	if raw.Key != "usg_geo" {
+		t.Fatalf("key = %q, want usg_geo", raw.Key)
+	}
+	ipf, ok := raw.Data["ip_filtering"].(map[string]any)
+	if !ok {
+		t.Fatalf("ip_filtering missing: %+v", raw.Data)
+	}
+	if ipf["enabled"] != true || ipf["action"] != "block" ||
+		ipf["countries"] != "KP,RU" || ipf["traffic_direction"] != "both" {
+		t.Errorf("ip_filtering mismatch: %+v", ipf)
+	}
+
+	// Unconfigured optional fields are omitted; enabled defaults to false.
+	raw = usgGeoRawSetting(&settingUsgGeoIPFilteringModel{
+		Enabled:          types.BoolNull(),
+		Block:            types.StringNull(),
+		Countries:        types.StringValue("KP"),
+		TrafficDirection: types.StringNull(),
+	})
+	ipf, ok = raw.Data["ip_filtering"].(map[string]any)
+	if !ok {
+		t.Fatalf("ip_filtering missing: %+v", raw.Data)
+	}
+	if ipf["enabled"] != false {
+		t.Errorf("unconfigured enabled must serialize false: %+v", ipf)
+	}
+	if _, ok := ipf["action"]; ok {
+		t.Errorf("unconfigured action must be omitted: %+v", ipf)
+	}
+	if _, ok := ipf["traffic_direction"]; ok {
+		t.Errorf("unconfigured traffic_direction must be omitted: %+v", ipf)
+	}
+}
+
+// TestApplyUsgGeoIPFiltering guards the #374 read path: a stored usg_geo
+// setting is authoritative and overrides the geo fields of the usg struct,
+// including mapping action back to the legacy block field.
+func TestApplyUsgGeoIPFiltering(t *testing.T) {
+	// go-unifi no longer carries the geo_ip_filtering_* fields on settings.Usg,
+	// so the values live on the usgWithGeo carrier.
+	geo := &usgWithGeo{
+		Usg:                   &settings.Usg{},
+		GeoIPFilteringEnabled: false,
+		GeoIPFilteringBlock:   "allow",
+	}
+	applyUsgGeoIPFiltering(geo, map[string]any{
+		"key": "usg_geo",
+		"ip_filtering": map[string]any{
+			"enabled":           true,
+			"action":            "block",
+			"countries":         "KP,RU",
+			"traffic_direction": "both",
+		},
+	})
+	if !geo.GeoIPFilteringEnabled || geo.GeoIPFilteringBlock != "block" ||
+		geo.GeoIPFilteringCountries != "KP,RU" ||
+		geo.GeoIPFilteringTrafficDirection != "both" {
+		t.Errorf("override mismatch: %+v", geo)
+	}
+
+	// A list-shaped countries payload is normalized to the comma form.
+	applyUsgGeoIPFiltering(geo, map[string]any{
+		"ip_filtering": map[string]any{
+			"countries": []any{"CN", "KP"},
+		},
+	})
+	if geo.GeoIPFilteringCountries != "CN,KP" {
+		t.Errorf("countries list not normalized: %q", geo.GeoIPFilteringCountries)
+	}
+
+	// Missing/malformed ip_filtering leaves the carrier untouched.
+	before := *geo
+	applyUsgGeoIPFiltering(geo, map[string]any{"ip_filtering": "bogus"})
+	applyUsgGeoIPFiltering(geo, map[string]any{})
+	if *geo != before {
+		t.Errorf("no-op payloads must not modify the carrier")
+	}
+}
+
+// TestUsgGeoConfigured covers the plan gate for the #374 paths.
+func TestUsgGeoConfigured(t *testing.T) {
+	unmanaged := &settingUsgGeoIPFilteringModel{
+		Enabled:          types.BoolNull(),
+		Block:            types.StringNull(),
+		Countries:        types.StringNull(),
+		TrafficDirection: types.StringNull(),
+	}
+	if usgGeoConfigured(unmanaged) {
+		t.Error("all-null geo fields must not count as configured")
+	}
+	managed := &settingUsgGeoIPFilteringModel{
+		Enabled:          types.BoolNull(),
+		Block:            types.StringNull(),
+		Countries:        types.StringValue("KP"),
+		TrafficDirection: types.StringNull(),
+	}
+	if !usgGeoConfigured(managed) {
+		t.Error("any configured geo field must count as configured")
+	}
+}
+
+// testSettingObj builds a known nested object from a sub-model for tests.
+func testSettingObj(t *testing.T, attrTypes map[string]attr.Type, model any) types.Object {
+	t.Helper()
+	obj, diags := types.ObjectValueFrom(context.Background(), attrTypes, model)
+	if diags.HasError() {
+		t.Fatalf("building nested object: %v", diags)
+	}
+	return obj
+}
+
+func testMgmtAutoUpgradeObj(t *testing.T, enabled types.Bool, hour types.Int64) types.Object {
+	t.Helper()
+	return testSettingObj(t, mgmtAutoUpgradeAttrTypes, settingMgmtAutoUpgradeModel{
+		Enabled: enabled,
+		Hour:    hour,
+	})
+}
+
+// testMgmtSSHObj builds a mgmt.ssh object, defaulting an untyped zero Keys
+// list to its typed null so partial literals stay readable.
+func testMgmtSSHObj(t *testing.T, m settingMgmtSSHModel) types.Object {
+	t.Helper()
+	if m.Keys.IsNull() && m.Keys.ElementType(context.Background()) == nil {
+		m.Keys = types.ListNull(types.ObjectType{AttrTypes: mgmtSSHKeyAttrTypes})
+	}
+	return testSettingObj(t, mgmtSSHAttrTypes, m)
+}
+
+// TestSettingUpgradeState_v1NestsPrefixedGroups guards the v1 -> v2 schema
+// upgrade: the flat usg tcp_*/udp_*/upnp_*/geo_ip_filtering_*/offload_*,
+// mgmt ssh_*/auto_upgrade*, syslog netconsole_*/this_controller* and ips
+// suppression_* attributes move into nested objects while every other
+// attribute passes through.
+func TestSettingUpgradeState_v1NestsPrefixedGroups(t *testing.T) {
+	ctx := context.Background()
+	r := &settingResource{}
+
+	var schemaResp fwresource.SchemaResponse
+	r.Schema(ctx, fwresource.SchemaRequest{}, &schemaResp)
+	if schemaResp.Schema.Version != 2 {
+		t.Fatalf("setting schema Version = %d, want 2", schemaResp.Schema.Version)
+	}
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	prior := []byte(`{
+		"id": "default", "site": "default",
+		"usg": {
+			"ftp_module": true, "icmp_timeout": "30s", "other_timeout": "10m0s",
+			"tcp_close_timeout": "10s", "tcp_close_wait_timeout": "1m0s",
+			"tcp_established_timeout": "2h4m0s", "tcp_fin_wait_timeout": "2m0s",
+			"tcp_last_ack_timeout": "30s", "tcp_syn_recv_timeout": "1m0s",
+			"tcp_syn_sent_timeout": "2m0s", "tcp_time_wait_timeout": "2m0s",
+			"udp_other_timeout": "30s", "udp_stream_timeout": "3m0s",
+			"upnp_enabled": true, "upnp_nat_pmp_enabled": false,
+			"upnp_secure_mode": true, "upnp_wan_interface": "WAN2",
+			"geo_ip_filtering_enabled": true, "geo_ip_filtering_block": "block",
+			"geo_ip_filtering_countries": "KP,RU", "geo_ip_filtering_traffic_direction": "both",
+			"offload_accounting": true, "offload_l2_blocking": false, "offload_sch": true
+		},
+		"mgmt": {
+			"auto_upgrade": true, "auto_upgrade_hour": 3,
+			"ssh_enabled": true, "ssh_username": "admin", "ssh_password": "s3cret",
+			"ssh_auth_password_enabled": false,
+			"ssh_keys": [{"name": "k", "type": "ssh-rsa", "key": "AAAA", "comment": "c"}],
+			"wifiman_enabled": true
+		},
+		"syslog": {
+			"enabled": true, "ip": "10.0.0.9", "port": 514,
+			"netconsole_enabled": true, "netconsole_host": "10.0.0.7", "netconsole_port": 1514,
+			"this_controller": true, "this_controller_encrypted_only": false
+		},
+		"ips": {
+			"ips_mode": "disabled",
+			"suppression_whitelist": [{"direction": "both", "mode": "ip", "value": "10.0.0.5"}],
+			"suppression_alerts": [{
+				"category": "emerging-scan", "gid": 1, "id": 2003068,
+				"signature": "ET SCAN", "type": "all", "tracking": []
+			}]
+		}
+	}`)
+
+	up, ok := r.UpgradeState(ctx)[1]
+	if !ok {
+		t.Fatal("no upgrader registered for schema version 1")
+	}
+	resp := &fwresource.UpgradeStateResponse{}
+	up.StateUpgrader(ctx, fwresource.UpgradeStateRequest{
+		RawState: &tfprotov6.RawState{JSON: prior},
+	}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("upgrade failed: %v", resp.Diagnostics)
+	}
+	val, err := resp.DynamicValue.Unmarshal(schemaType)
+	if err != nil {
+		t.Fatalf("unmarshal upgraded value: %v", err)
+	}
+
+	var root map[string]tftypes.Value
+	if err := val.As(&root); err != nil {
+		t.Fatalf("as object: %v", err)
+	}
+	obj := func(v tftypes.Value, name string) map[string]tftypes.Value {
+		t.Helper()
+		var m map[string]tftypes.Value
+		if err := v.As(&m); err != nil {
+			t.Fatalf("%s: as object: %v (value %v)", name, err, v)
+		}
+		return m
+	}
+	str := func(v tftypes.Value, name, want string) {
+		t.Helper()
+		var s string
+		if err := v.As(&s); err != nil || s != want {
+			t.Errorf("%s = %v (%v), want %q", name, v, err, want)
+		}
+	}
+	num := func(v tftypes.Value, name string, want int64) {
+		t.Helper()
+		var f big.Float
+		if err := v.As(&f); err != nil {
+			t.Errorf("%s = %v (%v), want %d", name, v, err, want)
+			return
+		}
+		if n, _ := f.Int64(); n != want {
+			t.Errorf("%s = %d, want %d", name, n, want)
+		}
+	}
+	boolean := func(v tftypes.Value, name string, want bool) {
+		t.Helper()
+		var b bool
+		if err := v.As(&b); err != nil || b != want {
+			t.Errorf("%s = %v (%v), want %v", name, v, err, want)
+		}
+	}
+	noFlat := func(m map[string]tftypes.Value, group string, keys ...string) {
+		t.Helper()
+		for _, k := range keys {
+			if _, exists := m[k]; exists {
+				t.Errorf("flat attribute %s.%q survived the upgrade", group, k)
+			}
+		}
+	}
+
+	str(root["site"], "site", "default")
+
+	usg := obj(root["usg"], "usg")
+	noFlat(usg, "usg", "tcp_close_timeout", "udp_other_timeout", "upnp_enabled",
+		"geo_ip_filtering_enabled", "offload_sch")
+	boolean(usg["ftp_module"], "usg.ftp_module", true)
+	str(usg["icmp_timeout"], "usg.icmp_timeout", "30s")
+	str(usg["other_timeout"], "usg.other_timeout", "10m0s")
+	tcp := obj(usg["tcp"], "usg.tcp")
+	str(tcp["close_timeout"], "usg.tcp.close_timeout", "10s")
+	str(tcp["close_wait_timeout"], "usg.tcp.close_wait_timeout", "1m0s")
+	str(tcp["established_timeout"], "usg.tcp.established_timeout", "2h4m0s")
+	str(tcp["fin_wait_timeout"], "usg.tcp.fin_wait_timeout", "2m0s")
+	str(tcp["last_ack_timeout"], "usg.tcp.last_ack_timeout", "30s")
+	str(tcp["syn_recv_timeout"], "usg.tcp.syn_recv_timeout", "1m0s")
+	str(tcp["syn_sent_timeout"], "usg.tcp.syn_sent_timeout", "2m0s")
+	str(tcp["time_wait_timeout"], "usg.tcp.time_wait_timeout", "2m0s")
+	udp := obj(usg["udp"], "usg.udp")
+	str(udp["other_timeout"], "usg.udp.other_timeout", "30s")
+	str(udp["stream_timeout"], "usg.udp.stream_timeout", "3m0s")
+	upnp := obj(usg["upnp"], "usg.upnp")
+	boolean(upnp["enabled"], "usg.upnp.enabled", true)
+	boolean(upnp["nat_pmp_enabled"], "usg.upnp.nat_pmp_enabled", false)
+	boolean(upnp["secure_mode"], "usg.upnp.secure_mode", true)
+	str(upnp["wan_interface"], "usg.upnp.wan_interface", "WAN2")
+	geo := obj(usg["geo_ip_filtering"], "usg.geo_ip_filtering")
+	boolean(geo["enabled"], "usg.geo_ip_filtering.enabled", true)
+	str(geo["block"], "usg.geo_ip_filtering.block", "block")
+	str(geo["countries"], "usg.geo_ip_filtering.countries", "KP,RU")
+	str(geo["traffic_direction"], "usg.geo_ip_filtering.traffic_direction", "both")
+	off := obj(usg["offload"], "usg.offload")
+	boolean(off["accounting"], "usg.offload.accounting", true)
+	boolean(off["l2_blocking"], "usg.offload.l2_blocking", false)
+	boolean(off["sch"], "usg.offload.sch", true)
+	if !usg["dns_verification"].IsNull() {
+		t.Errorf("usg.dns_verification absent from prior state must upgrade to null, got %v",
+			usg["dns_verification"])
+	}
+
+	mgmt := obj(root["mgmt"], "mgmt")
+	noFlat(mgmt, "mgmt", "auto_upgrade_hour", "ssh_enabled", "ssh_keys", "ssh_username",
+		"ssh_password", "ssh_auth_password_enabled")
+	boolean(mgmt["wifiman_enabled"], "mgmt.wifiman_enabled", true)
+	au := obj(mgmt["auto_upgrade"], "mgmt.auto_upgrade")
+	boolean(au["enabled"], "mgmt.auto_upgrade.enabled", true)
+	num(au["hour"], "mgmt.auto_upgrade.hour", 3)
+	ssh := obj(mgmt["ssh"], "mgmt.ssh")
+	boolean(ssh["enabled"], "mgmt.ssh.enabled", true)
+	str(ssh["username"], "mgmt.ssh.username", "admin")
+	str(ssh["password"], "mgmt.ssh.password", "s3cret")
+	boolean(ssh["auth_password_enabled"], "mgmt.ssh.auth_password_enabled", false)
+	var keys []tftypes.Value
+	if err := ssh["keys"].As(&keys); err != nil || len(keys) != 1 {
+		t.Fatalf("mgmt.ssh.keys = %v (%v), want one element", ssh["keys"], err)
+	}
+	str(obj(keys[0], "mgmt.ssh.keys[0]")["name"], "mgmt.ssh.keys[0].name", "k")
+
+	syslog := obj(root["syslog"], "syslog")
+	noFlat(syslog, "syslog", "netconsole_enabled", "netconsole_host", "netconsole_port",
+		"this_controller_encrypted_only")
+	str(syslog["ip"], "syslog.ip", "10.0.0.9")
+	nc := obj(syslog["netconsole"], "syslog.netconsole")
+	boolean(nc["enabled"], "syslog.netconsole.enabled", true)
+	str(nc["host"], "syslog.netconsole.host", "10.0.0.7")
+	num(nc["port"], "syslog.netconsole.port", 1514)
+	tc := obj(syslog["this_controller"], "syslog.this_controller")
+	boolean(tc["enabled"], "syslog.this_controller.enabled", true)
+	boolean(tc["encrypted_only"], "syslog.this_controller.encrypted_only", false)
+
+	ips := obj(root["ips"], "ips")
+	noFlat(ips, "ips", "suppression_whitelist", "suppression_alerts")
+	str(ips["ips_mode"], "ips.ips_mode", "disabled")
+	supp := obj(ips["suppression"], "ips.suppression")
+	var wl, alerts []tftypes.Value
+	if err := supp["whitelist"].As(&wl); err != nil || len(wl) != 1 {
+		t.Fatalf("ips.suppression.whitelist = %v (%v), want one element", supp["whitelist"], err)
+	}
+	str(obj(wl[0], "whitelist[0]")["value"], "ips.suppression.whitelist[0].value", "10.0.0.5")
+	if err := supp["alerts"].As(&alerts); err != nil || len(alerts) != 1 {
+		t.Fatalf("ips.suppression.alerts = %v (%v), want one element", supp["alerts"], err)
+	}
+	num(obj(alerts[0], "alerts[0]")["id"], "ips.suppression.alerts[0].id", 2003068)
+
+	// Sections absent from prior state upgrade to null objects.
+	for _, name := range []string{"radius", "ntp", "doh", "lcm"} {
+		if !root[name].IsNull() {
+			t.Errorf("%s absent from prior state must upgrade to null, got %v", name, root[name])
+		}
+	}
+}
+
+// TestSettingUpgradeState_v0AlsoNests guards that the oldest upgrader still
+// converts integer-second timeouts to durations AND applies the nesting
+// rewrite, since every upgrader targets the current schema.
+func TestSettingUpgradeState_v0AlsoNests(t *testing.T) {
+	ctx := context.Background()
+	r := &settingResource{}
+
+	var schemaResp fwresource.SchemaResponse
+	r.Schema(ctx, fwresource.SchemaRequest{}, &schemaResp)
+	schemaType := schemaResp.Schema.Type().TerraformType(ctx)
+
+	prior := []byte(`{
+		"id": "default", "site": "default",
+		"radius": {"interim_update_interval": 600},
+		"usg": {"icmp_timeout": 30, "tcp_established_timeout": 7440, "udp_stream_timeout": 180,
+			"upnp_enabled": true}
+	}`)
+
+	up, ok := r.UpgradeState(ctx)[0]
+	if !ok {
+		t.Fatal("no upgrader registered for schema version 0")
+	}
+	resp := &fwresource.UpgradeStateResponse{}
+	up.StateUpgrader(ctx, fwresource.UpgradeStateRequest{
+		RawState: &tfprotov6.RawState{JSON: prior},
+	}, resp)
+	if resp.Diagnostics.HasError() {
+		t.Fatalf("upgrade failed: %v", resp.Diagnostics)
+	}
+	val, err := resp.DynamicValue.Unmarshal(schemaType)
+	if err != nil {
+		t.Fatalf("unmarshal upgraded value: %v", err)
+	}
+	var root map[string]tftypes.Value
+	if err := val.As(&root); err != nil {
+		t.Fatalf("as object: %v", err)
+	}
+	var radius, usg, tcp, udp, upnp map[string]tftypes.Value
+	if err := root["radius"].As(&radius); err != nil {
+		t.Fatalf("radius: %v", err)
+	}
+	if err := root["usg"].As(&usg); err != nil {
+		t.Fatalf("usg: %v", err)
+	}
+	if err := usg["tcp"].As(&tcp); err != nil {
+		t.Fatalf("usg.tcp: %v (value %v)", err, usg["tcp"])
+	}
+	if err := usg["udp"].As(&udp); err != nil {
+		t.Fatalf("usg.udp: %v (value %v)", err, usg["udp"])
+	}
+	if err := usg["upnp"].As(&upnp); err != nil {
+		t.Fatalf("usg.upnp: %v (value %v)", err, usg["upnp"])
+	}
+	got := map[string]tftypes.Value{
+		"radius.interim_update_interval": radius["interim_update_interval"],
+		"usg.icmp_timeout":               usg["icmp_timeout"],
+		"usg.tcp.established_timeout":    tcp["established_timeout"],
+		"usg.udp.stream_timeout":         udp["stream_timeout"],
+	}
+	for name, want := range map[string]string{
+		"radius.interim_update_interval": "10m0s",
+		"usg.icmp_timeout":               "30s",
+		"usg.tcp.established_timeout":    "2h4m0s",
+		"usg.udp.stream_timeout":         "3m0s",
+	} {
+		var s string
+		if err := got[name].As(&s); err != nil || s != want {
+			t.Errorf("%s = %v (%v), want %q", name, got[name], err, want)
+		}
+	}
+	var enabled bool
+	if err := upnp["enabled"].As(&enabled); err != nil || !enabled {
+		t.Errorf("usg.upnp.enabled = %v (%v), want true", upnp["enabled"], err)
+	}
+	if _, exists := usg["tcp_established_timeout"]; exists {
+		t.Error("flat usg.tcp_established_timeout survived the v0 upgrade")
+	}
+}
+
+// TestSettingNestedGroups_roundTrip covers the model<->go-unifi conversions
+// for the nested groups introduced in schema v2: API -> model (with every
+// group configured in the plan) -> API must reproduce the original setting,
+// and an unset group must contribute nothing on the write side.
+func TestSettingNestedGroups_roundTrip(t *testing.T) {
+	ctx := context.Background()
+	r := &settingResource{}
+	dur := func(d time.Duration) timetypes.GoDuration { return timetypes.NewGoDurationValue(d) }
+
+	t.Run("usg", func(t *testing.T) {
+		api := &usgWithGeo{
+			GeoIPFilteringEnabled:          true,
+			GeoIPFilteringBlock:            "block",
+			GeoIPFilteringCountries:        "KP,RU",
+			GeoIPFilteringTrafficDirection: "both",
+		}
+		api.Usg = &settings.Usg{
+			FtpModule:             true,
+			OffloadAccounting:     true,
+			OffloadSch:            true,
+			TCPCloseTimeout:       10,
+			TCPEstablishedTimeout: 7440,
+			TCPTimeWaitTimeout:    120,
+			UDPOtherTimeout:       30,
+			UDPStreamTimeout:      180,
+			UPnPEnabled:           true,
+			UPnPSecureMode:        true,
+			UPnPWANInterface:      "WAN2",
+		}
+		// A plan that manages every leaf of every group.
+		plan := &settingUSGModel{
+			FtpModule:       types.BoolValue(false),
+			DNSVerification: types.ObjectNull(usgDNSVerificationAttrTypes),
+			GeoIPFiltering: testSettingObj(
+				t,
+				usgGeoIPFilteringAttrTypes,
+				settingUsgGeoIPFilteringModel{
+					Enabled: types.BoolValue(false),
+					Block:   types.StringValue("allow"),
+					Countries: types.StringValue(
+						"US",
+					),
+					TrafficDirection: types.StringValue("ingress"),
+				},
+			),
+			Offload: testSettingObj(t, usgOffloadAttrTypes, settingUsgOffloadModel{
+				Accounting: types.BoolValue(
+					false,
+				),
+				L2Blocking: types.BoolValue(false),
+				Sch:        types.BoolValue(false),
+			}),
+			TCP: testSettingObj(t, usgTCPAttrTypes, settingUsgTCPModel{
+				CloseTimeout: dur(time.Second), CloseWaitTimeout: dur(time.Second),
+				EstablishedTimeout: dur(time.Second), FinWaitTimeout: dur(time.Second),
+				LastAckTimeout: dur(time.Second), SynRecvTimeout: dur(time.Second),
+				SynSentTimeout: dur(time.Second), TimeWaitTimeout: dur(time.Second),
+			}),
+			UDP: testSettingObj(t, usgUDPAttrTypes, settingUsgUDPModel{
+				OtherTimeout: dur(time.Second), StreamTimeout: dur(time.Second),
+			}),
+			UPnP: testSettingObj(t, usgUPnPAttrTypes, settingUsgUPnPModel{
+				Enabled: types.BoolValue(false), NATPmpEnabled: types.BoolValue(false),
+				SecureMode: types.BoolValue(false), WANInterface: types.StringValue("WAN"),
+			}),
+		}
+		model := r.usgSettingToModel(ctx, api, plan)
+
+		geo, ok, _ := util.ObjectAs[settingUsgGeoIPFilteringModel](ctx, model.GeoIPFiltering)
+		if !ok || !geo.Enabled.ValueBool() || geo.Block.ValueString() != "block" ||
+			geo.Countries.ValueString() != "KP,RU" || geo.TrafficDirection.ValueString() != "both" {
+			t.Errorf("geo_ip_filtering read-back mismatch: %+v (known=%v)", geo, ok)
+		}
+		tcp, ok, _ := util.ObjectAs[settingUsgTCPModel](ctx, model.TCP)
+		if !ok || tcp.CloseTimeout.ValueString() != "10s" ||
+			tcp.EstablishedTimeout.ValueString() != "2h4m0s" ||
+			tcp.TimeWaitTimeout.ValueString() != "2m0s" {
+			t.Errorf("tcp read-back mismatch: %+v (known=%v)", tcp, ok)
+		}
+		// An API zero for a configured duration reads back as 0s (as the
+		// flat leaves did), never as null.
+		if tcp.FinWaitTimeout.IsNull() || tcp.FinWaitTimeout.ValueString() != "0s" {
+			t.Errorf("tcp.fin_wait_timeout = %v, want 0s", tcp.FinWaitTimeout)
+		}
+		upnp, ok, _ := util.ObjectAs[settingUsgUPnPModel](ctx, model.UPnP)
+		if !ok || !upnp.Enabled.ValueBool() || upnp.NATPmpEnabled.ValueBool() ||
+			!upnp.SecureMode.ValueBool() || upnp.WANInterface.ValueString() != "WAN2" {
+			t.Errorf("upnp read-back mismatch: %+v (known=%v)", upnp, ok)
+		}
+		off, ok, _ := util.ObjectAs[settingUsgOffloadModel](ctx, model.Offload)
+		if !ok || !off.Accounting.ValueBool() || off.L2Blocking.ValueBool() ||
+			!off.Sch.ValueBool() {
+			t.Errorf("offload read-back mismatch: %+v (known=%v)", off, ok)
+		}
+
+		back := r.usgModelToSetting(ctx, model, nil)
+		if *back.Usg != *api.Usg {
+			t.Errorf("usg round-trip mismatch:\n got %+v\nwant %+v", back.Usg, api.Usg)
+		}
+		if back.GeoIPFilteringEnabled != api.GeoIPFilteringEnabled ||
+			back.GeoIPFilteringBlock != api.GeoIPFilteringBlock ||
+			back.GeoIPFilteringCountries != api.GeoIPFilteringCountries ||
+			back.GeoIPFilteringTrafficDirection != api.GeoIPFilteringTrafficDirection {
+			t.Errorf("usg geo round-trip mismatch:\n got %+v\nwant %+v", back, api)
+		}
+
+		// Unconfigured groups: null on read, nothing on write.
+		unmanaged := r.usgSettingToModel(ctx, api, &settingUSGModel{
+			DNSVerification: types.ObjectNull(usgDNSVerificationAttrTypes),
+			GeoIPFiltering:  types.ObjectNull(usgGeoIPFilteringAttrTypes),
+			Offload:         types.ObjectUnknown(usgOffloadAttrTypes),
+			TCP:             types.ObjectNull(usgTCPAttrTypes),
+			UDP:             types.ObjectUnknown(usgUDPAttrTypes),
+			UPnP:            types.ObjectNull(usgUPnPAttrTypes),
+		})
+		for name, obj := range map[string]types.Object{
+			"geo_ip_filtering": unmanaged.GeoIPFiltering, "offload": unmanaged.Offload,
+			"tcp": unmanaged.TCP, "udp": unmanaged.UDP, "upnp": unmanaged.UPnP,
+		} {
+			if !obj.IsNull() {
+				t.Errorf("unconfigured usg.%s must read back null, got %v", name, obj)
+			}
+		}
+		empty := r.usgModelToSetting(ctx, &settingUSGModel{
+			DNSVerification: types.ObjectNull(usgDNSVerificationAttrTypes),
+			GeoIPFiltering:  types.ObjectUnknown(usgGeoIPFilteringAttrTypes),
+			Offload:         types.ObjectNull(usgOffloadAttrTypes),
+			TCP:             types.ObjectUnknown(usgTCPAttrTypes),
+			UDP:             types.ObjectNull(usgUDPAttrTypes),
+			UPnP:            types.ObjectUnknown(usgUPnPAttrTypes),
+		}, nil)
+		if *empty.Usg != (settings.Usg{}) || empty.GeoIPFilteringEnabled ||
+			empty.GeoIPFilteringBlock != "" || empty.GeoIPFilteringCountries != "" ||
+			empty.GeoIPFilteringTrafficDirection != "" {
+			t.Errorf("unset usg groups must serialize zero values, got %+v", empty)
+		}
+	})
+
+	t.Run("mgmt", func(t *testing.T) {
+		hour := int64(3)
+		api := &settings.Mgmt{
+			AutoUpgrade:            true,
+			AutoUpgradeHour:        &hour,
+			SSHEnabled:             true,
+			SSHUsername:            "admin",
+			SSHAuthPasswordEnabled: true,
+			SSHKeys: []settings.SettingMgmtSSHKeys{
+				{Name: "k", KeyType: "ssh-rsa", Key: "AAAA", Comment: "c"},
+			},
+		}
+		keysType := types.ObjectType{AttrTypes: mgmtSSHKeyAttrTypes}
+		emptyKeys, _ := types.ListValueFrom(ctx, keysType, []sshKeyModel{})
+		plan := &settingMgmtModel{
+			AutoUpgrade: testMgmtAutoUpgradeObj(t, types.BoolValue(false), types.Int64Value(1)),
+			SSH: testMgmtSSHObj(t, settingMgmtSSHModel{
+				Enabled: types.BoolValue(false), Username: types.StringValue("x"),
+				Password: types.StringValue("s3cret"), AuthPasswordEnabled: types.BoolValue(false),
+				Keys: emptyKeys,
+			}),
+		}
+		model := r.mgmtSettingToModel(ctx, api, plan)
+		au, ok, _ := util.ObjectAs[settingMgmtAutoUpgradeModel](ctx, model.AutoUpgrade)
+		if !ok || !au.Enabled.ValueBool() || au.Hour.ValueInt64() != 3 {
+			t.Errorf("auto_upgrade read-back mismatch: %+v (known=%v)", au, ok)
+		}
+		ssh, ok, _ := util.ObjectAs[settingMgmtSSHModel](ctx, model.SSH)
+		if !ok || !ssh.Enabled.ValueBool() || ssh.Username.ValueString() != "admin" ||
+			ssh.Password.ValueString() != "s3cret" || !ssh.AuthPasswordEnabled.ValueBool() ||
+			len(ssh.Keys.Elements()) != 1 {
+			t.Errorf("ssh read-back mismatch: %+v (known=%v)", ssh, ok)
+		}
+
+		back := r.mgmtModelToSetting(ctx, model, &settings.Mgmt{})
+		if !back.AutoUpgrade || back.AutoUpgradeHour == nil || *back.AutoUpgradeHour != 3 ||
+			!back.SSHEnabled || back.SSHUsername != "admin" || back.SSHPassword != "s3cret" ||
+			!back.SSHAuthPasswordEnabled || len(back.SSHKeys) != 1 || back.SSHKeys[0].Name != "k" {
+			t.Errorf("mgmt round-trip mismatch: %+v", back)
+		}
+
+		// Unset groups leave the read-base untouched.
+		base := &settings.Mgmt{AutoUpgrade: true, SSHEnabled: true, SSHUsername: "keep"}
+		got := r.mgmtModelToSetting(ctx, &settingMgmtModel{
+			AutoUpgrade: types.ObjectUnknown(mgmtAutoUpgradeAttrTypes),
+			SSH:         types.ObjectNull(mgmtSSHAttrTypes),
+		}, base)
+		if !got.AutoUpgrade || !got.SSHEnabled || got.SSHUsername != "keep" {
+			t.Errorf("unset mgmt groups must not clobber the base: %+v", got)
+		}
+	})
+
+	t.Run("syslog", func(t *testing.T) {
+		var diags diag.Diagnostics
+		port := int64(1514)
+		api := &settings.Rsyslogd{
+			Enabled:                     true,
+			IP:                          "10.0.0.9",
+			NetconsoleEnabled:           true,
+			NetconsoleHost:              "10.0.0.7",
+			NetconsolePort:              &port,
+			ThisController:              true,
+			ThisControllerEncryptedOnly: true,
+		}
+		model := r.syslogSettingToModel(ctx, api, &diags)
+		if diags.HasError() {
+			t.Fatalf("settingToModel: %v", diags)
+		}
+		nc, ok, _ := util.ObjectAs[settingSyslogNetconsoleModel](ctx, model.Netconsole)
+		if !ok || !nc.Enabled.ValueBool() || nc.Host.ValueString() != "10.0.0.7" ||
+			nc.Port.ValueInt64() != 1514 {
+			t.Errorf("netconsole read-back mismatch: %+v (known=%v)", nc, ok)
+		}
+		tc, ok, _ := util.ObjectAs[settingSyslogThisControllerModel](ctx, model.ThisController)
+		if !ok || !tc.Enabled.ValueBool() || !tc.EncryptedOnly.ValueBool() {
+			t.Errorf("this_controller read-back mismatch: %+v (known=%v)", tc, ok)
+		}
+
+		back := r.syslogModelToSetting(ctx, &model, &diags)
+		if diags.HasError() {
+			t.Fatalf("modelToSetting: %v", diags)
+		}
+		if back.NetconsoleEnabled != api.NetconsoleEnabled ||
+			back.NetconsoleHost != api.NetconsoleHost ||
+			back.NetconsolePort == nil ||
+			*back.NetconsolePort != 1514 ||
+			back.ThisController != api.ThisController ||
+			back.ThisControllerEncryptedOnly != api.ThisControllerEncryptedOnly {
+			t.Errorf("syslog round-trip mismatch: %+v", back)
+		}
+
+		// An empty host reads back null (as the flat leaf did) and the
+		// this_controller object default reproduces the old leaf defaults.
+		api.NetconsoleHost = ""
+		model = r.syslogSettingToModel(ctx, api, &diags)
+		nc, _, _ = util.ObjectAs[settingSyslogNetconsoleModel](ctx, model.Netconsole)
+		if !nc.Host.IsNull() {
+			t.Errorf("empty netconsole host must read back null, got %v", nc.Host)
+		}
+		def, ok, _ := util.ObjectAs[settingSyslogThisControllerModel](
+			ctx,
+			settingSyslogThisControllerDefault(),
+		)
+		if !ok || def.Enabled.ValueBool() || def.EncryptedOnly.ValueBool() {
+			t.Errorf("this_controller default = %+v, want enabled=false encrypted_only=false", def)
+		}
+	})
+
+	t.Run("ips suppression", func(t *testing.T) {
+		var diags diag.Diagnostics
+		gid, id := int64(1), int64(2003068)
+		api := &settings.Ips{IPsMode: "disabled"}
+		apiSupp := &settings.IpsSuppression{
+			Whitelist: []settings.SettingIpsSuppressionWhitelist{
+				{Direction: "both", Mode: "ip", Value: "10.0.0.5"},
+			},
+			Alerts: []settings.SettingIpsSuppressionAlerts{
+				{
+					Category:  "emerging-scan",
+					Gid:       &gid,
+					ID:        &id,
+					Signature: "ET SCAN",
+					Type:      "all",
+				},
+			},
+		}
+		whitelistType := types.ObjectType{AttrTypes: ipsWhitelistAttrTypes}
+		alertType := types.ObjectType{AttrTypes: ipsAlertAttrTypes}
+		emptyWL, _ := types.ListValueFrom(ctx, whitelistType, []settingIpsWhitelistModel{})
+		emptyAlerts, _ := types.ListValueFrom(ctx, alertType, []settingIpsAlertModel{})
+		plan := &settingIpsModel{
+			IPSMode: types.StringValue("ids"),
+			Suppression: testSettingObj(t, ipsSuppressionAttrTypes, settingIpsSuppressionModel{
+				Whitelist: emptyWL, Alerts: emptyAlerts,
+			}),
+		}
+		model := r.ipsSettingToModel(ctx, api, plan, &diags, apiSupp)
+		if diags.HasError() {
+			t.Fatalf("settingToModel: %v", diags)
+		}
+		supp, ok, _ := util.ObjectAs[settingIpsSuppressionModel](ctx, model.Suppression)
+		if !ok || len(supp.Whitelist.Elements()) != 1 || len(supp.Alerts.Elements()) != 1 {
+			t.Fatalf("suppression read-back mismatch: %+v (known=%v)", supp, ok)
+		}
+
+		back, backSupp := r.ipsModelToSetting(ctx, model, &diags, nil)
+		if diags.HasError() {
+			t.Fatalf("modelToSetting: %v", diags)
+		}
+		if back.IPsMode != "disabled" || backSupp == nil ||
+			len(
+				backSupp.Whitelist,
+			) != 1 || backSupp.Whitelist[0].Value != "10.0.0.5" ||
+			len(
+				backSupp.Alerts,
+			) != 1 || backSupp.Alerts[0].Signature != "ET SCAN" ||
+			backSupp.Alerts[0].ID == nil || *backSupp.Alerts[0].ID != 2003068 {
+			t.Errorf("ips suppression round-trip mismatch: %+v", backSupp)
+		}
+
+		// Unconfigured group: null on read, no suppression on write.
+		unmanaged := r.ipsSettingToModel(ctx, api, &settingIpsModel{
+			Suppression: types.ObjectUnknown(ipsSuppressionAttrTypes),
+		}, &diags, apiSupp)
+		if !unmanaged.Suppression.IsNull() {
+			t.Errorf("unconfigured suppression must read back null, got %v", unmanaged.Suppression)
+		}
+		_, emptySupp := r.ipsModelToSetting(ctx, &settingIpsModel{
+			Suppression: types.ObjectNull(ipsSuppressionAttrTypes),
+		}, &diags, nil)
+		if emptySupp != nil {
+			t.Errorf("unset suppression must not be sent, got %+v", emptySupp)
+		}
+	})
 }

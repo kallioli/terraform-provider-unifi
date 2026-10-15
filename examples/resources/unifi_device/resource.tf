@@ -23,21 +23,60 @@ resource "unifi_device" "us_24_poe" {
   name = "Switch with POE"
 
   port_override {
-    number          = 1
+    index           = 1
     name            = "port w/ poe"
     port_profile_id = unifi_port_profile.poe.id
+    poe_mode        = "auto" # auto, pasv24, passthrough, off
   }
 
   port_override {
-    number          = 2
+    index           = 2
     name            = "disabled"
     port_profile_id = data.unifi_port_profile.disabled.id
   }
 
-  # port aggregation for ports 11 and 12
+  # Link aggregation: port 11 is the aggregate lead, bonding member port 12.
   port_override {
-    number              = 11
-    op_mode             = "aggregate"
-    aggregate_num_ports = 2
+    index             = 11
+    op_mode           = "aggregate" # switch, mirror, aggregate
+    aggregate_members = [12]
+  }
+}
+
+# Grouped settings: LED, spanning tree and the per-port feature groups are
+# nested objects rather than prefixed attributes.
+resource "unifi_device" "us_8_60w" {
+  mac  = "01:23:45:67:89:AC"
+  name = "Rack switch"
+
+  led = {
+    override   = "on"
+    color      = "#00ff00"
+    brightness = 50
+  }
+
+  stp = {
+    version  = "rstp"
+    priority = 4096
+  }
+
+  port_override {
+    index = 1
+    name  = "camera"
+
+    dot1x = {
+      ctrl = "force_authorized"
+    }
+    port_security = {
+      enabled     = true
+      mac_address = ["aa:bb:cc:dd:ee:01"]
+    }
+    stormctrl = {
+      type = "level"
+      bcast = {
+        enabled = true
+        level   = 50
+      }
+    }
   }
 }

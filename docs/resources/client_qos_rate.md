@@ -15,8 +15,10 @@ Manages a client QOS rate, which can be used to limit bandwidth for groups of cl
 resource "unifi_client_qos_rate" "wifi" {
   name = "wifi"
 
-  qos_rate_max_down = 2000 # 2mbps
-  qos_rate_max_up   = 10   # 10kbps
+  qos_rate = {
+    max_down = 2000 # 2mbps
+    max_up   = 10   # 10kbps
+  }
 }
 
 
@@ -41,19 +43,38 @@ resource "unifi_client" "test" {
 
 ### Optional
 
-- `qos_rate_max_down` (Number) The QOS maximum download rate.
-- `qos_rate_max_up` (Number) The QOS maximum upload rate.
+- `qos_rate` (Attributes) QoS rate limits applied to clients in this group, in kbps. (see [below for nested schema](#nestedatt--qos_rate))
 - `site` (String) The name of the site to associate the client QOS rate with.
+- `timeouts` (Attributes) (see [below for nested schema](#nestedatt--timeouts))
 
 ### Read-Only
 
 - `id` (String) The ID of the client QOS rate.
 
+<a id="nestedatt--qos_rate"></a>
+### Nested Schema for `qos_rate`
+
+Optional:
+
+- `max_down` (Number) The QOS maximum download rate.
+- `max_up` (Number) The QOS maximum upload rate.
+
+
+<a id="nestedatt--timeouts"></a>
+### Nested Schema for `timeouts`
+
+Optional:
+
+- `create` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+- `delete` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Setting a timeout for a Delete operation is only applicable if changes are saved into state before the destroy operation occurs.
+- `read` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours). Read operations occur during any refresh or planning operation when refresh is enabled.
+- `update` (String) A string that can be [parsed as a duration](https://pkg.go.dev/time#ParseDuration) consisting of numbers and unit suffixes, such as "30s" or "2h45m". Valid time units are "s" (seconds), "m" (minutes), "h" (hours).
+
 ## Import
 
 Import is supported using the following syntax:
 
-The [` + "`" + `terraform import` + "`" + ` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
+The [`terraform import` command](https://developer.hashicorp.com/terraform/cli/commands/import) can be used, for example:
 
 ```shell
 # import using the ID

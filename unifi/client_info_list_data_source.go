@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"time"
 
+	"github.com/hashicorp/terraform-plugin-framework-timeouts/datasource/timeouts"
 	"github.com/hashicorp/terraform-plugin-framework/datasource"
 	"github.com/hashicorp/terraform-plugin-framework/datasource/schema"
 	"github.com/hashicorp/terraform-plugin-framework/types"
@@ -24,8 +26,9 @@ type clientInfoListDataSource struct {
 }
 
 type clientInfoListDataSourceModel struct {
-	Site    types.String `tfsdk:"site"`
-	Clients types.List   `tfsdk:"clients"`
+	Site     types.String   `tfsdk:"site"`
+	Clients  types.List     `tfsdk:"clients"`
+	Timeouts timeouts.Value `tfsdk:"timeouts"`
 }
 
 func (d *clientInfoListDataSource) Metadata(
@@ -57,6 +60,7 @@ func (d *clientInfoListDataSource) Schema(
 					Attributes: models.Attributes(),
 				},
 			},
+			"timeouts": timeouts.Attributes(ctx),
 		},
 	}
 }
@@ -95,6 +99,14 @@ func (d *clientInfoListDataSource) Read(
 		return
 	}
 
+	readTimeout, timeoutDiags := data.Timeouts.Read(ctx, 20*time.Minute)
+	resp.Diagnostics.Append(timeoutDiags...)
+	if resp.Diagnostics.HasError() {
+		return
+	}
+	ctx, cancel := context.WithTimeout(ctx, readTimeout)
+	defer cancel()
+
 	site := data.Site.ValueString()
 	// Track whether the site was explicitly set by the user. An explicit site
 	// that results in a 404 is more likely a misconfiguration and should remain
@@ -131,7 +143,10 @@ func (d *clientInfoListDataSource) Read(
 
 	clientObjects := make([]basetypes.ObjectValue, len(clientInfoList))
 	for i, ci := range clientInfoList {
-		v := models.ClientInfoAttrValues(ctx, &ci)
+		v, d := models.ClientInfoAttrValues(ctx, &ci)
+		if resp.Diagnostics.Append(d...); resp.Diagnostics.HasError() {
+			return
+		}
 		o, d := types.ObjectValue(models.AttributeTypes(), v)
 		if resp.Diagnostics.Append(d...); resp.Diagnostics.HasError() {
 			return
