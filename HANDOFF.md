@@ -1,5 +1,5 @@
 # HANDOFF — unifi-provider
-_Mis à jour : 2026-10-15 14:15_
+_Mis à jour : 2026-10-15 21:50_
 
 ## Objectif
 Faire évoluer le provider Terraform/OpenTofu UniFi (`ubiquiti-community/terraform-provider-unifi`, fork `kallioli`) pour couvrir ce qui manque au réseau domestique de Kevin en infrastructure as code (projet voisin `~/work/unifi-network`, provider `~> 0.56`). Première cible, décidée par Kevin le 2026-10-15 : le réglage **SNMP / SNMPv3 du contrôleur** (Settings > System > SNMP), aujourd'hui posé à la main dans l'UI pour la supervision Zabbix.
@@ -14,12 +14,14 @@ Faire évoluer le provider Terraform/OpenTofu UniFi (`ubiquiti-community/terrafo
 - [x] **Aucun travail SNMP sur dev-kevin** : pas de branche, pas de commit, pas de stash, copie de travail propre, rien non plus dans go-unifi. Les 9 branches locales de Kevin (non poussées sur le fork) portent sur les défauts statiques, device config_network, port_forward `enabled` ; dernière activité 2026-10-03.
 - [x] **Piste trouvée dans les notes de Kevin du 2026-10-03** : la PR amont **#485 (jaxzin)** ajoute `snmp` à `unifi_setting`. Bloquée par sa base (`feat/attribute-nesting`, PR #478, helpers `util.NestFields`/`WithObject`/`UpgradeRawState`), Kevin a demandé un rebase sur `main`. Réserve de Kevin : l'écho en lecture de `community`/`x_password` n'est vérifié que sur l'image de test, et **le réglage `snmp` est absent de `get/setting` sur un vrai UCG-Fiber 10.6.106** ; il a suggéré le motif write-only `password_wo`. État actuel de #485 demandé au lobby.
 - [ ] Bloc `snmp` dans `unifi_setting` : à faire (voir Notes, « Où insérer SNMP »), sur une branche `claude/setting-snmp` basée sur **`upstream/main`** (en attendant l'accès GitHub : `devkevin-upstream/main`, 2026-10-03, à rafraîchir ensuite), pas sur le `main` du fork. Ne pas toucher au `main` local. Décision à prendre : repartir de #485 (si rebasée) ou écrire le bloc ici.
-- [ ] Contrôleur de test en conteneur podman sur la VM : accepté par le lobby, **commande prête (voir Notes), à lancer seulement après le go de Kevin**.
+- [x] 2026-10-15 : **go de Kevin pour le conteneur de test**, lancé sur la VM (voir Notes « Contrôleur de test ») : image `docker.io/jacobalberty/unifi:latest` = UniFi Network **10.0.162**, mode simulation, admin/admin, `https://localhost:8443`. **Tourne encore** (`podman ps`), à arrêter avec `podman compose -f <scratchpad>/unifi-test-compose.yaml down` ou `podman rm -f unifi`.
+- [x] **Sonde SNMP sur le conteneur** (curl puis go-unifi) : (1) la clé `snmp` est **absente de `get/setting` tant qu'aucun `set` n'a eu lieu**, puis présente ; cohérent avec la note de Kevin sur le UCG-Fiber ; `GetSetting[*settings.Snmp]` renvoie bien `NotFoundError` dans ce cas, le Create doit le tolérer (comme igmp). (2) `set/setting/snmp` avec `enabledV3`, `username`, `x_password` est accepté et **`x_password` est renvoyé en clair** par `get/setting` et `get/setting/snmp` sur ce contrôleur. (3) `UpdateSetting` + relecture avec le modèle généré `settings.Snmp` de go-unifi v1.33.43 fonctionnent sans modification de la bibliothèque. Reste inconnu : le comportement d'un vrai UniFi OS 10.x (UCG/UDM) pour la relecture du mot de passe.
+- [x] Outillage complet sur la VM : go 1.27.1, golangci-lint 2.14.0 (installé via le proxy Go, shim mise, base à 0 problème), tfplugindocs (`go generate` sans écart ; il crée `docs/actions` et `docs/list-resources`, non suivis par l'amont, à supprimer), terraform 1.16.5, tofu 1.13.1, podman 5.8.2.
 
 ## Prochaine étape
 1. Attendre Kevin : accès github.com (lecture au minimum) ou sa réponse directe sur la PR amont #485 : ouverte, rebasée, fermée ? Si elle est rebasée sur `main` et propre, la stratégie devient : la relire, la tester, et pousser l'amont à la fusionner (ou la reprendre avec l'accord de son auteur). Sinon, écrire le bloc ici.
 2. Créer `claude/setting-snmp` depuis `devkevin-upstream/main` (puis `upstream/main` dès l'accès GitHub), ajouter le bloc `snmp` à `unifi_setting` en suivant le modèle `igmp_snooping` (commit `f6939506`), mot de passe en **write-only** (`password_wo`, motif suggéré par Kevin sur #485) plutôt que `Sensitive` + relecture, avec test unitaire de conversion.
-3. Question c revisitée : le vrai point à vérifier est si `get/setting` renvoie une entrée `snmp` sur le contrôleur de Kevin (absente sur un UCG-Fiber 10.6.106 selon ses notes). Si elle n'existe qu'après un premier `set`, le Create doit tolérer `NotFoundError` (déjà le cas dans le modèle igmp). Test sur le conteneur après le go de Kevin, et un `GET` par Kevin sur son contrôleur.
+3. Question c : tranchée sur le conteneur (clé absente avant le premier `set`, `x_password` relu en clair). Reste à Kevin un `GET /api/s/default/get/setting/snmp` en lecture sur son contrôleur réel pour confirmer la relecture du mot de passe sous UniFi OS ; sans confirmation, concevoir le bloc pour ne **pas** dépendre de la relecture (write-only ou valeur du plan conservée).
 3. Mettre à jour `docs/resources/setting.md` par `go generate ./...` (tfplugindocs est déclaré en `tool` dans go.mod), plus `examples/resources/unifi_setting/resource.tf` et `CHANGELOG.md`.
 
 ## Blocages / questions pour Kevin
@@ -66,13 +68,14 @@ Donc **aucune modification de go-unifi** n'est nécessaire a priori (à confirme
 6. Test unitaire `unifi/setting_snmp_test.go` sur le modèle de `TestIgmpSnoopingModelMerge` (sans contrôleur) ; test d'acceptation `TestAccSetting_snmp` dans `setting_resource_test.go` si on lance la CI amont.
 Puis `go generate ./...` (docs), `examples/resources/unifi_setting/resource.tf`, `CHANGELOG.md`, `go vet`, `golangci-lint`.
 
-### Contrôleur de test (préparé, ne pas lancer sans le go de Kevin)
-Depuis la racine du dépôt, en reprenant le `docker-compose.yaml` du projet (mode simulation, admin seedé par `scripts/init.d/demo-mode`, 3 AP, 1 passerelle, 5 switches de démo) :
+### Contrôleur de test (go de Kevin le 2026-10-15, en cours d'exécution)
+Le `docker-compose.yaml` du dépôt ne démarre pas tel quel sur code-1 : podman exige un nom d'image qualifié (`docker.io/...`) et **le port 8080 de l'hôte est déjà pris**. Un compose de session, copie du fichier du dépôt avec l'image qualifiée et `18080:8080`, est dans le scratchpad de la session (`unifi-test-compose.yaml`) ; à recréer au besoin (le scratchpad ne survit pas à la session). Sonde curl : `snmp-probe.sh [get|set]` au même endroit ; sonde go-unifi : `gounifi-probe/`.
 ```sh
-podman compose -f docker-compose.yaml up -d
-podman logs -f unifi            # attendre la fin du démarrage (~2 min)
-curl -sk https://localhost:8443/manage/account/login -o /dev/null -w '%{http_code}\n'
+podman pull docker.io/jacobalberty/unifi:latest
+podman compose -f <compose de session> up -d
+curl -sk https://localhost:8443/manage/account/login -o /dev/null -w '%{http_code}\n'   # 200 après ~1 min
 ```
+Authentification de l'API classique : `POST /api/login` `{"username":"admin","password":"admin"}`, cookie + en-tête `X-Csrf-Token` pour les écritures.
 Puis, pour la relecture de `x_password` (question c), un `GET https://localhost:8443/api/s/default/get/setting` authentifié admin/admin, ou bien les tests d'acceptation sans relancer de conteneur :
 ```sh
 UNIFI_SKIP_CONTAINER=1 UNIFI_API=https://localhost:8443 UNIFI_USERNAME=admin UNIFI_PASSWORD=admin UNIFI_INSECURE=true \
