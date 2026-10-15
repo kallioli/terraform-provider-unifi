@@ -1,5 +1,5 @@
 # HANDOFF — unifi-provider
-_Mis à jour : 2026-10-15 14:00_
+_Mis à jour : 2026-10-15 14:15_
 
 ## Objectif
 Faire évoluer le provider Terraform/OpenTofu UniFi (`ubiquiti-community/terraform-provider-unifi`, fork `kallioli`) pour couvrir ce qui manque au réseau domestique de Kevin en infrastructure as code (projet voisin `~/work/unifi-network`, provider `~> 0.56`). Première cible, décidée par Kevin le 2026-10-15 : le réglage **SNMP / SNMPv3 du contrôleur** (Settings > System > SNMP), aujourd'hui posé à la main dans l'UI pour la supervision Zabbix.
@@ -17,7 +17,7 @@ Faire évoluer le provider Terraform/OpenTofu UniFi (`ubiquiti-community/terrafo
 - [ ] Contrôleur de test en conteneur podman sur la VM : accepté par le lobby, **commande prête (voir Notes), à lancer seulement après le go de Kevin**.
 
 ## Prochaine étape
-1. Réponse du lobby sur la PR amont #485 : ouverte, rebasée, fermée ? Si elle est rebasée sur `main` et propre, la stratégie devient : la relire, la tester, et pousser l'amont à la fusionner (ou la reprendre avec l'accord de son auteur). Sinon, écrire le bloc ici.
+1. Attendre Kevin : accès github.com (lecture au minimum) ou sa réponse directe sur la PR amont #485 : ouverte, rebasée, fermée ? Si elle est rebasée sur `main` et propre, la stratégie devient : la relire, la tester, et pousser l'amont à la fusionner (ou la reprendre avec l'accord de son auteur). Sinon, écrire le bloc ici.
 2. Créer `claude/setting-snmp` depuis `devkevin-upstream/main` (puis `upstream/main` dès l'accès GitHub), ajouter le bloc `snmp` à `unifi_setting` en suivant le modèle `igmp_snooping` (commit `f6939506`), mot de passe en **write-only** (`password_wo`, motif suggéré par Kevin sur #485) plutôt que `Sensitive` + relecture, avec test unitaire de conversion.
 3. Question c revisitée : le vrai point à vérifier est si `get/setting` renvoie une entrée `snmp` sur le contrôleur de Kevin (absente sur un UCG-Fiber 10.6.106 selon ses notes). Si elle n'existe qu'après un premier `set`, le Create doit tolérer `NotFoundError` (déjà le cas dans le modèle igmp). Test sur le conteneur après le go de Kevin, et un `GET` par Kevin sur son contrôleur.
 3. Mettre à jour `docs/resources/setting.md` par `go generate ./...` (tfplugindocs est déclaré en `tool` dans go.mod), plus `examples/resources/unifi_setting/resource.tf` et `CHANGELOG.md`.
@@ -87,5 +87,5 @@ Sans `UNIFI_SKIP_CONTAINER`, `make testacc` lance lui-même le compose via testc
 
 ### Demandes ouvertes (sessions)
 - Lobby, 2026-10-15 : état des lieux + HANDOFF. Réponse envoyée le 2026-10-15 ; retour du lobby reçu (amont v0.59.0, consignes de branche, conteneur accepté). Questions (a) accès GitHub et (d) cible PR/release remontées à Kevin par le lobby : **en attente**.
-- Vers le lobby, 2026-10-15 14:00 : demande de l'état de la PR amont #485 (snmp) et de #478 (attribute-nesting) en lecture publique GitHub. **En attente.**
+- Vers le lobby, 2026-10-15 14:00 : demande de l'état de la PR amont #485 (snmp) et de #478. **Refusée par le lobby, à raison** : github.com hors registre pour lui aussi. Question remontée à Kevin par le lobby avec la demande d'accès github.com en lecture. **En attente de Kevin, pas de code avant.**
 - Accès dev-kevin : validé par Kevin le 2026-10-15 en session, lecture seule, compte `kallioli`, dépôts `~/Projects/terraform-provider-unifi` et `~/Projects/go-unifi`. À inscrire au registre s'il doit durer.
