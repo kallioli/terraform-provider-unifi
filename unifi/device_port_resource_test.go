@@ -2,6 +2,7 @@ package unifi
 
 import (
 	"context"
+	"regexp"
 	"testing"
 	"time"
 
@@ -74,6 +75,34 @@ func TestParseDevicePortImportID(t *testing.T) {
 			}
 			if index != tt.wantIndex {
 				t.Errorf("index = %d, want %d", index, tt.wantIndex)
+			}
+		})
+	}
+}
+
+func TestDevicePortExists(t *testing.T) {
+	t.Parallel()
+
+	table := []unifi.DevicePortTable{{PortIdx: 1}, {PortIdx: 2}, {PortIdx: 3}}
+
+	cases := []struct {
+		name   string
+		table  []unifi.DevicePortTable
+		index  int64
+		wantN  int
+		wantOK bool
+	}{
+		{"listed", table, 2, 3, true},
+		{"not listed", table, 4, 3, false},
+		{"empty table cannot be checked", nil, 48, 0, true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			n, ok := devicePortExists(tc.table, tc.index)
+			if n != tc.wantN || ok != tc.wantOK {
+				t.Fatalf("devicePortExists(%d) = (%d, %v), want (%d, %v)",
+					tc.index, n, ok, tc.wantN, tc.wantOK)
 			}
 		})
 	}
@@ -492,6 +521,27 @@ resource "unifi_device_port" "seven" {
 
 // testAccDevicePortSwitch adopts the simulated switch the port tests use, so
 // the tests do not depend on another test having adopted it first.
+// A port the switch does not have is refused before anything is written: the
+// simulated US 48 PoE reports 52 ports in its port_table.
+func TestAccDevicePort_unknownPort(t *testing.T) {
+	resource.Test(t, resource.TestCase{
+		PreCheck:                 func() { preCheck(t) },
+		ProtoV6ProviderFactories: testAccProtoV6ProviderFactories,
+		Steps: []resource.TestStep{
+			{
+				Config: testAccDevicePortSwitch() + `
+resource "unifi_device_port" "nope" {
+	device_mac = unifi_device.sw.mac
+	index      = 99
+	name       = "does-not-exist"
+}
+`,
+				ExpectError: regexp.MustCompile(`Port Not Found`),
+			},
+		},
+	})
+}
+
 func testAccDevicePortSwitch() string {
 	return `
 resource "unifi_device" "sw" {

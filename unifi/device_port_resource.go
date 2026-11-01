@@ -288,9 +288,19 @@ func (r *devicePortResource) write(
 		return plan, site, diags
 	}
 
+	if n, ok := devicePortExists(device.PortTable, index); !ok {
+		diags.AddError(
+			"Port Not Found",
+			fmt.Sprintf(
+				"Device %s has no port %d: its port table lists %d ports.",
+				mac, index, n,
+			),
+		)
+		return plan, site, diags
+	}
+
 	// A port can be managed before it has an override entry: the entry is then
-	// appended, as for a new port_override block, and the controller rejects an
-	// index the device does not have.
+	// appended, as for a new port_override block.
 	declared, d := portOverrideModelToAPI(ctx, plan.portOverrideModel)
 	diags.Append(d...)
 	if diags.HasError() {
@@ -588,6 +598,22 @@ func parseDevicePortImportID(importID string) (site, mac string, index int64, er
 }
 
 // findPortOverride returns the override entry of port index, if the device has one.
+// devicePortExists reports whether the device's port table lists the port, and
+// how many ports the table has. An empty table (device not yet provisioned, or
+// a controller that does not report it) cannot be checked and counts as a match,
+// the controller then rejects an index the device does not have.
+func devicePortExists(table []unifi.DevicePortTable, index int64) (int, bool) {
+	if len(table) == 0 {
+		return 0, true
+	}
+	for _, p := range table {
+		if p.PortIdx == index {
+			return len(table), true
+		}
+	}
+	return len(table), false
+}
+
 func findPortOverride(
 	overrides []unifi.DevicePortOverrides,
 	index int64,
