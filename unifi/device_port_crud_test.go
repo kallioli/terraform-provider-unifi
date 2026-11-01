@@ -122,12 +122,6 @@ func (f *fakeSwitch) overrides() []any {
 	return po
 }
 
-func (f *fakeSwitch) setOverrides(po ...any) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.device["port_overrides"] = po
-}
-
 func (f *fakeSwitch) putCount() int {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -182,7 +176,8 @@ func devicePortRead(
 	resp := &fwresource.ReadResponse{State: tfState(t, s, prior), Identity: tfIdentity(t, r)}
 	if withIdentity {
 		id := tfIdentity(t, r)
-		if d := id.Set(context.Background(), devicePortIdentity(fakeSwitchMAC, 2, "default")); d.HasError() {
+		d := id.Set(context.Background(), devicePortIdentity(fakeSwitchMAC, 2, "default"))
+		if d.HasError() {
 			t.Fatalf("identity: %v", d)
 		}
 		req.Identity = id
