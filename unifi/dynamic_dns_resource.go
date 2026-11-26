@@ -289,7 +289,12 @@ func (r *dynamicDNSResource) Read(
 		identity.ID = data.ID
 	}
 
-	id := identity.ID.ValueString()
+	// The state ID wins over the identity: a stored identity cannot change, so
+	// it keeps the old ID after Read follows the object to a new one.
+	id := data.ID.ValueString()
+	if id == "" {
+		id = identity.ID.ValueString()
+	}
 	site := identity.Site.ValueString()
 	if site == "" {
 		site = data.Site.ValueString()
@@ -370,7 +375,11 @@ func (r *dynamicDNSResource) Update(
 	// Apply the plan changes to the state object
 	r.applyPlanToState(ctx, &plan, &state)
 
-	id := identity.ID.ValueString()
+	// Prefer the state ID over the identity, as in Read.
+	id := state.ID.ValueString()
+	if id == "" {
+		id = identity.ID.ValueString()
+	}
 	site := identity.Site.ValueString()
 	if site == "" {
 		site = state.Site.ValueString()
@@ -443,7 +452,11 @@ func (r *dynamicDNSResource) Delete(
 		identity.ID = data.ID
 	}
 
-	id := identity.ID.ValueString()
+	// Prefer the state ID over the identity, as in Read.
+	id := data.ID.ValueString()
+	if id == "" {
+		id = identity.ID.ValueString()
+	}
 	site := identity.Site.ValueString()
 	if site == "" {
 		site = data.Site.ValueString()

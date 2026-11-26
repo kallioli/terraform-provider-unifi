@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
+	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/ubiquiti-community/go-unifi/unifi"
 )
 
@@ -236,5 +237,50 @@ func TestDeleteAlreadyGone(t *testing.T) {
 				}
 			})
 		}
+	}
+}
+
+// TestDynamicDNSPrefersStateID checks that unifi_dynamic_dns looks its object
+// up by the state ID, not by the stored identity. The identity cannot change
+// once stored, so after Read follows the object to a new ID it still holds
+// the old one; looking up by it dropped the resource from state on refresh
+// and sent the delete to the old ID.
+func TestDynamicDNSPrefersStateID(t *testing.T) {
+	ctx := context.Background()
+	const object = `{"meta":{"rc":"ok"},"data":[{"_id":"new1","service":"dyndns",` +
+		`"host_name":"h.example.com","interface":"wan"}]}`
+	client, seen := newDeleteFakeController(t, map[string]cannedReply{
+		"GET /api/s/default/rest/dynamicdns/new1":    {http.StatusOK, object},
+		"GET /api/s/default/rest/dynamicdns/old1":    {http.StatusOK, restEmpty},
+		"DELETE /api/s/default/rest/dynamicdns/new1": {http.StatusOK, restEmpty},
+	})
+	r := &dynamicDNSResource{client: client}
+	s := resourceSchema(t, r)
+	state := tfState(t, s, map[string]any{
+		"id": "new1", "site": "default", "service": "dyndns", "host_name": "h.example.com",
+	})
+	identity := tfIdentity(t, r)
+	identity.Raw = tftypes.NewValue(identity.Raw.Type(), map[string]tftypes.Value{
+		"id":   tftypes.NewValue(tftypes.String, "old1"),
+		"site": tftypes.NewValue(tftypes.String, "default"),
+	})
+
+	readResp := &fwresource.ReadResponse{State: state, Identity: identity}
+	r.Read(ctx, fwresource.ReadRequest{State: state, Identity: identity}, readResp)
+	if readResp.Diagnostics.HasError() {
+		t.Fatalf("read: %v", readResp.Diagnostics)
+	}
+	if readResp.State.Raw.IsNull() {
+		t.Fatalf("read dropped the resource; requests = %v", seen())
+	}
+
+	delResp := &fwresource.DeleteResponse{State: state}
+	r.Delete(ctx, fwresource.DeleteRequest{State: state, Identity: identity}, delResp)
+	if delResp.Diagnostics.HasError() {
+		t.Fatalf("delete: %v; requests = %v", delResp.Diagnostics, seen())
+	}
+	got := seen()
+	if want := "DELETE /api/s/default/rest/dynamicdns/new1"; got[len(got)-1] != want {
+		t.Fatalf("requests = %v, want the last one to be %q", got, want)
 	}
 }

@@ -1,0 +1,3 @@
+kind: fix
+body: '**`unifi_dynamic_dns` looks its object up by the state `id` instead of the stored resource identity.** A stored identity cannot change, so once Read follows the object to a new ID the identity keeps the old one. Read, update and delete used the identity first and could drop the resource from state, update or delete the wrong ID; they now use the state `id`, like the other resources, and fall back to the identity only when the state has none.'
+time: 2026-11-26T22:11:00Z
