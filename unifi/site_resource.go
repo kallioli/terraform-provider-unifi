@@ -408,6 +408,12 @@ func (r *siteFrameworkResource) Delete(
 
 	_, err := r.client.DeleteSite(ctx, id)
 	if err != nil {
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetSite(ctx, id)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error Deleting Site",
 			"Could not delete site with ID "+id+": "+err.Error(),

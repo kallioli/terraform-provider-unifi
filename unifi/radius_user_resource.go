@@ -598,8 +598,15 @@ func (r *radiusUserResource) Delete(
 	}
 
 	// Delete the account
-	err := r.client.DeleteAccount(ctx, site, data.ID.ValueString())
+	id := data.ID.ValueString()
+	err := r.client.DeleteAccount(ctx, site, id)
 	if err != nil {
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetAccount(ctx, site, id)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error Deleting Radius User",
 			err.Error(),

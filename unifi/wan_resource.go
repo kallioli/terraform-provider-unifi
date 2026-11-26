@@ -1638,6 +1638,12 @@ func (r *wanResource) Delete(
 		if strings.Contains(err.Error(), "NoDelete") {
 			return
 		}
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetNetwork(ctx, site, networkID)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Client Error",
 			fmt.Sprintf("Unable to delete WAN network, got error: %s", err),

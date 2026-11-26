@@ -386,8 +386,15 @@ func (r *firewallZoneResource) Delete(
 		site = r.client.Site
 	}
 
-	err := r.client.DeleteFirewallZone(ctx, site, data.ID.ValueString())
+	id := data.ID.ValueString()
+	err := r.client.DeleteFirewallZone(ctx, site, id)
 	if err != nil {
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetFirewallZone(ctx, site, id)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError("Error Deleting Firewall Zone", err.Error())
 		return
 	}

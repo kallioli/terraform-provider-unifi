@@ -682,8 +682,15 @@ func (r *vpnClientResource) Delete(
 
 	// Delete the network
 	name := data.Name.ValueString()
-	err := r.client.DeleteNetwork(ctx, site, data.ID.ValueString(), name)
+	id := data.ID.ValueString()
+	err := r.client.DeleteNetwork(ctx, site, id, name)
 	if err != nil {
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetNetwork(ctx, site, id)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error Deleting VPN Client",
 			err.Error(),

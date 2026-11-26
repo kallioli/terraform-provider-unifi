@@ -507,13 +507,16 @@ func (r *wireguardPeerResource) Delete(
 		site = r.client.Site
 	}
 
-	err := r.client.DeleteWireGuardPeer(
-		ctx,
-		site,
-		data.NetworkID.ValueString(),
-		data.ID.ValueString(),
-	)
+	networkID := data.NetworkID.ValueString()
+	id := data.ID.ValueString()
+	err := r.client.DeleteWireGuardPeer(ctx, site, networkID, id)
 	if err != nil {
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetWireGuardPeer(ctx, site, networkID, id)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error Deleting WireGuard Peer",
 			err.Error(),

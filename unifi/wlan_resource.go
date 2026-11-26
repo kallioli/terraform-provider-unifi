@@ -1872,6 +1872,12 @@ func (r *wlanFrameworkResource) Delete(
 
 	err := r.client.DeleteWLAN(ctx, site, id)
 	if err != nil {
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetWLAN(ctx, site, id)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error Deleting WLAN",
 			"Could not delete WLAN with ID "+id+": "+err.Error(),

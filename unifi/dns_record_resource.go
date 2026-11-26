@@ -503,8 +503,15 @@ func (r *dnsRecordFrameworkResource) Delete(
 	}
 
 	// Delete the DNS record
-	err := r.client.DeleteDNSRecord(ctx, site, data.ID.ValueString())
+	id := data.ID.ValueString()
+	err := r.client.DeleteDNSRecord(ctx, site, id)
 	if err != nil {
+		if alreadyDeleted(err, func() error {
+			_, err := r.client.GetDNSRecord(ctx, site, id)
+			return err
+		}) {
+			return
+		}
 		resp.Diagnostics.AddError(
 			"Error Deleting Dns Record",
 			err.Error(),
