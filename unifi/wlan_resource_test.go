@@ -499,26 +499,6 @@ func Test_wlanFrameworkResource_Configure(t *testing.T) {
 	})
 }
 
-func Test_wlanFrameworkResource_setDefaultWLANGroupID(t *testing.T) {
-	t.Skip("requires configured client")
-}
-
-func Test_wlanFrameworkResource_Read(t *testing.T) {
-	t.Skip("requires terraform state and configured client")
-}
-
-func Test_wlanFrameworkResource_readPassphraseWO(t *testing.T) {
-	t.Skip("requires terraform state")
-}
-
-func Test_wlanFrameworkResource_Delete(t *testing.T) {
-	t.Skip("requires terraform state and configured client")
-}
-
-func Test_wlanFrameworkResource_ImportState(t *testing.T) {
-	t.Skip("requires terraform state and configured client")
-}
-
 func Test_wlanFrameworkResource_planToWLAN(t *testing.T) {
 	ctx := context.Background()
 	r := &wlanFrameworkResource{}
@@ -587,10 +567,6 @@ func Test_wlanFrameworkResource_ListResourceConfigSchema(t *testing.T) {
 	r := &wlanFrameworkResource{}
 	resp := &fwlist.ListResourceSchemaResponse{}
 	r.ListResourceConfigSchema(context.Background(), fwlist.ListResourceSchemaRequest{}, resp)
-}
-
-func Test_wlanFrameworkResource_List(t *testing.T) {
-	t.Skip("requires configured client")
 }
 
 // TestWLANPrivatePresharedKeys_roundTrip exercises the private pre-shared key

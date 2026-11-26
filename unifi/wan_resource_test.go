@@ -791,30 +791,6 @@ func Test_wanResource_Configure(t *testing.T) {
 	})
 }
 
-func Test_wanResource_Create(t *testing.T) {
-	t.Skip("requires terraform state machinery")
-}
-
-func Test_wanResource_adoptExistingWAN(t *testing.T) {
-	t.Skip("requires configured client")
-}
-
-func Test_wanResource_overlayConfig(t *testing.T) {
-	t.Skip("requires complex state setup")
-}
-
-func Test_wanResource_Read(t *testing.T) {
-	t.Skip("requires terraform state machinery")
-}
-
-func Test_wanResource_Delete(t *testing.T) {
-	t.Skip("requires terraform state machinery")
-}
-
-func Test_wanResource_ImportState(t *testing.T) {
-	t.Skip("requires terraform state machinery")
-}
-
 // Test_wanResource_pppoeCredentials covers #515. The credentials were absent
 // from go-unifi's WAN payload entirely, so a PPPoE login could not be managed.
 // Now that they travel, the important guarantee is the other direction: an
@@ -1147,10 +1123,6 @@ func Test_wanResource_ListResourceConfigSchema(t *testing.T) {
 			t.Fatalf("ListResourceConfigSchema() returned errors: %v", resp.Diagnostics)
 		}
 	})
-}
-
-func Test_wanResource_List(t *testing.T) {
-	t.Skip("requires configured client")
 }
 
 // TestWANUpgradeState_v0NestsPrefixedGroups guards the v0 -> v1 schema
