@@ -13,6 +13,7 @@ import (
 	"github.com/hashicorp/terraform-plugin-testing/helper/resource"
 	"github.com/hashicorp/terraform-plugin-testing/plancheck"
 	"github.com/ubiquiti-community/go-unifi/unifi"
+	"github.com/ubiquiti-community/terraform-provider-unifi/unifi/util"
 )
 
 const wanTestID = "6650cc00000000000000a001"
@@ -211,7 +212,11 @@ func Test_wanResource_Update(t *testing.T) {
 		if diags := h.update(planned, config); diags.HasError() {
 			t.Fatalf("Update: %v", diags)
 		}
-		h.assertEqual("state after Update differs from the plan", planned, h.state.Raw)
+		resolved, err := util.ResolveUnknowns(planned, h.state.Raw)
+		if err != nil {
+			t.Fatalf("resolving the plan from the new state: %v", err)
+		}
+		h.assertEqual("state after Update differs from the plan", resolved, h.state.Raw)
 	})
 
 	t.Run("adding upnp, load_balance and dns sends only their known values", func(t *testing.T) {

@@ -661,8 +661,10 @@ func (r *networkResource) Schema(
 						Validators: []validator.String{
 							stringvalidator.OneOf("auto", "manual"),
 						},
+						// A network can be stored without it, and the controller may
+						// write its own value on save: a null prior stays unknown.
 						PlanModifiers: []planmodifier.String{
-							stringplanmodifier.UseStateForUnknown(),
+							stringplanmodifier.UseNonNullStateForUnknown(),
 						},
 					},
 					"aliases": schema.ListAttribute{

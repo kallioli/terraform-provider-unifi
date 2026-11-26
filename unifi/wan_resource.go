@@ -932,8 +932,10 @@ func (r *wanResource) Schema(
 				Validators: []validator.String{
 					stringvalidator.OneOf("auto", "manual"),
 				},
+				// A WAN can be stored without it, and the controller may write
+				// its own value on save: a null prior stays unknown on update.
 				PlanModifiers: []planmodifier.String{
-					stringplanmodifier.UseStateForUnknown(),
+					stringplanmodifier.UseNonNullStateForUnknown(),
 				},
 			},
 			"ipv6_setting_preference": schema.StringAttribute{
