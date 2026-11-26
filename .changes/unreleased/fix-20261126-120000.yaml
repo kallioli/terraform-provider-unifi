@@ -1,0 +1,3 @@
+kind: fix
+body: '**`unifi_device_port` and `unifi_device.port_override`: updating a port whose egress rate limit is disabled no longer fails with `api.err.InvalidPayload`.** `egress_rate_limit.kbps` is Optional+Computed, so an update planned it unknown when the configuration left it unset, and the unknown value was sent as `egress_rate_limit_kbps: 0`, which the controller rejects (the valid range starts at 64). An unknown or 0 rate is no longer sent, and a rate the configuration leaves unset keeps the value the controller stores instead of being dropped. Fixes #763.'
+time: 2026-11-26T12:00:00Z

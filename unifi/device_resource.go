@@ -2681,6 +2681,14 @@ func carryUnwritableFields(
 		declared.StpEdgeState = current.StpEdgeState
 	}
 
+	// egress_rate_limit.kbps is only written when config sets a rate (see
+	// portOverrideModelToAPI). Left unset, keep the rate the controller stores
+	// instead of dropping it with the rest of the entry.
+	if declared.EgressRateLimitKbps == nil && current.EgressRateLimitKbps != nil &&
+		*current.EgressRateLimitKbps > 0 {
+		declared.EgressRateLimitKbps = current.EgressRateLimitKbps
+	}
+
 	declared.EeeEnabled = current.EeeEnabled
 	declared.LdMode = current.LdMode
 	declared.LdStatus = current.LdStatus
@@ -3333,7 +3341,12 @@ func portOverrideModelToAPI(
 		model.EgressRateLimit,
 	); ok {
 		po.EgressRateLimitKbpsEnabled = util.ConvertBoolToAPIValue(erl.Enabled)
-		if !erl.Kbps.IsNull() {
+		// kbps is Optional+Computed, so it is planned unknown on update when
+		// config leaves it unset, and an unknown value converts to 0. The
+		// controller rejects 0 (the valid range starts at 64) and stores no
+		// rate as an empty value that reads back as 0, so neither an unknown
+		// nor a 0 is sent: carryUnwritableFields keeps the stored rate.
+		if isKnown(erl.Kbps) && erl.Kbps.ValueInt64() > 0 {
 			po.EgressRateLimitKbps = erl.Kbps.ValueInt64Pointer()
 		}
 	} else {
